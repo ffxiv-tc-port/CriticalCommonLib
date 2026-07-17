@@ -19,6 +19,11 @@ public class InventoryChange : ICsv, IItem
     public delegate InventoryChange FromGameItemFactory(InventoryItem? fromItem, InventoryItem? toItem, InventoryType inventoryType, bool firstLoad);
     public delegate InventoryChange FromProcessedChangeFactory(InventoryItem? fromItem, InventoryItem? toItem, InventoryChangeReason inventoryChangeReason, uint changeSetId);
 
+    public InventoryChange(InventoryItem.Factory inventoryItemFactory)
+    {
+        _inventoryItemFactory = inventoryItemFactory;
+    }
+
     public InventoryChange(InventoryItem.Factory inventoryItemFactory, InventoryItem? fromItem, InventoryItem? toItem, InventoryType inventoryType, bool firstLoad)
     {
         _inventoryItemFactory = inventoryItemFactory;
