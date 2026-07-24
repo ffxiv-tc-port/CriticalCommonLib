@@ -41,11 +41,6 @@ public class InventoryChange : ICsv, IItem
         ChangeDate = DateTime.Now;
         ChangeSetId = changeSetId;
     }
-    
-    public InventoryChange(InventoryItem.Factory inventoryItemFactory)
-    {
-        _inventoryItemFactory = inventoryItemFactory;
-    }
 
     public bool FirstLoad { get; private set; }
     public InventoryType InventoryType { get;private set; }
