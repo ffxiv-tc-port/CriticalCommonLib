@@ -25,4 +25,10 @@ public interface IMarketOrderService
     /// <returns></returns>
     public IEnumerable<FFXIVClientStructs.FFXIV.Client.Game.InventoryItem> SortByBackupRetainerMarketOrder(
         IEnumerable<FFXIVClientStructs.FFXIV.Client.Game.InventoryItem> item);
+
+    /// <summary>
+    /// Sorts raw retainer market inventory while keeping empty slots at the end.
+    /// </summary>
+    public IEnumerable<FFXIVClientStructs.FFXIV.Client.Game.InventoryItem> SortByRetainerMarketOrder(
+        IEnumerable<FFXIVClientStructs.FFXIV.Client.Game.InventoryItem> item);
 }
