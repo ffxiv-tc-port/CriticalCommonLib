@@ -14,9 +14,38 @@ public class InventoryHistory : IDisposable
     private List<InventoryChange> _history;
     private HashSet<InventoryChangeReason>? _reasonsToLog;
     private bool _enabled;
+    private int _maxEntries = 50000;
+    // Was previously derived from _history.Count + 1, which is only safe while history never shrinks.
+    // Now that old entries get trimmed off, that count can no longer be relied on to keep producing
+    // unique/increasing IDs, so track it separately instead.
+    private uint _nextChangeSetId = 1;
 
     public bool Enabled => _enabled;
     public HashSet<InventoryChangeReason> ReasonsToLog => _reasonsToLog ?? new HashSet<InventoryChangeReason>();
+
+    /// <summary>
+    /// Maximum number of history entries retained in memory (and subsequently written to history.csv).
+    /// Once exceeded, the oldest entries are dropped first. Defaults to 50,000 so that history.csv - which
+    /// is read/written in full on every plugin start/stop - can't grow without bound for long-running
+    /// characters. Set to 0 or a negative value to disable the limit entirely.
+    /// </summary>
+    public int MaxEntries
+    {
+        get => _maxEntries;
+        set
+        {
+            _maxEntries = value;
+            TrimHistory();
+        }
+    }
+
+    private void TrimHistory()
+    {
+        if (_maxEntries > 0 && _history.Count > _maxEntries)
+        {
+            _history = _history.Skip(_history.Count - _maxEntries).ToList();
+        }
+    }
 
     public InventoryHistory(IInventoryMonitor monitor, InventoryChange.FromProcessedChangeFactory processedChangeFactoryFactory)
     {
@@ -93,6 +122,7 @@ public class InventoryHistory : IDisposable
         var newChanges = changes.Where(c => (_reasonsToLog == null || _reasonsToLog.Contains(c.InventoryChangeReason)) &&  c.InventoryChangeReason != InventoryChangeReason.Moved).ToList();
         OnHistoryLogged?.Invoke(newChanges);
         _history = _history.Concat(newChanges).ToList();
+        TrimHistory();
     }
 
     public List<InventoryChange> GetHistory()
@@ -103,6 +133,8 @@ public class InventoryHistory : IDisposable
     public void LoadExistingHistory(List<InventoryChange> history)
     {
         _history = history;
+        _nextChangeSetId = _history.Count > 0 ? _history.Max(c => c.ChangeSetId) + 1 : 1;
+        TrimHistory();
     }
 
     private void ScannerOnBagsChanged(List<BagChange> changes)
@@ -117,7 +149,7 @@ public class InventoryHistory : IDisposable
 
     public List<InventoryChange> AnalyzeInventoryChanges(List<InventoryChange> changes)
     {
-        uint newChangeId = (uint)(_history.Count + 1);
+        uint newChangeId = _nextChangeSetId++;
         var processedFrom = new HashSet<int>();
         var processedTo = new HashSet<int>();
         var processedChanges = new List<InventoryChange>();

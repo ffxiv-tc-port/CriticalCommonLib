@@ -69,6 +69,13 @@ public class ThrottleDispatcher : IDisposable
                 }
 
                 _busy = false;
+
+                // Self-remove from the tracked list once the task is done so _trackedTasks doesn't
+                // grow forever for long-lived dispatchers - it used to only ever be cleared in Dispose().
+                lock (_locker)
+                {
+                    _trackedTasks.Remove(task);
+                }
             }, cancellationToken);
 
             if (_resetIntervalOnException)
@@ -88,11 +95,14 @@ public class ThrottleDispatcher : IDisposable
     {
         if (disposing)
         {
-            foreach (var task in _trackedTasks)
+            lock (_locker)
             {
-                task.Dispose();
+                foreach (var task in _trackedTasks)
+                {
+                    task.Dispose();
+                }
+                _trackedTasks.Clear();
             }
-            _trackedTasks.Clear();
         }
     }
 
