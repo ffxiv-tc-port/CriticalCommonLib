@@ -240,7 +240,10 @@ namespace CriticalCommonLib.MarketBoard
         {
             if (_worldIds == null)
             {
-                _worldIds = _worldSheet.Where(c => c.IsPublic).Select(c => c.RowId).ToList();
+                // 台服(陸行鳥 DataCenter=151)現役 8 個世界(RowId 4028-4035)的官方 IsPublic
+                // 全部是 False。這個 overload 目前(2026-08)全艦隊沒有呼叫點,但保留 fix
+                // 以免未來有人接上這個 overload 卻在台服拿到空的世界清單。
+                _worldIds = _worldSheet.Where(c => c.IsPublic || (c.RowId >= 4028 && c.RowId <= 4035)).Select(c => c.RowId).ToList();
             }
 
             return GetPricing(itemId, _worldIds, forceCheck);
