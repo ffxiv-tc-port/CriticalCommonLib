@@ -914,7 +914,16 @@ namespace CriticalCommonLib.Crafting
 
         public InventoryItem.ItemFlags GetRequiredFlag(uint itemId)
         {
-            var itemRow = _itemSheet.GetRow(itemId);
+            // This is reached with ingredient preference LinkedItem*Ids, which round trip through the
+            // saved list configuration and can name an item this client does not have. GetRow would
+            // hand back a fabricated empty row and cache it; IsCollectable resolves through a lookup
+            // dictionary so it would quietly answer false, but Base.CanBeHq below throws outright, and
+            // the cached empty row goes on to break unrelated GetRowOrDefault callers for the same id.
+            var itemRow = _itemSheet.GetRowOrDefault(itemId);
+            if (itemRow == null)
+            {
+                return InventoryItem.ItemFlags.None;
+            }
             if (itemRow.IsCollectable)
             {
                 return InventoryItem.ItemFlags.Collectable;
@@ -1573,8 +1582,13 @@ namespace CriticalCommonLib.Crafting
                         {
                             if (reductionIngredient.LinkedItemId != null)
                             {
-                                var reductionItem = _itemSheet.GetRow(reductionIngredient.LinkedItemId.Value);
-                                if (reductionItem.Sources.Any())
+                                // GetRowOrDefault, not GetRow: GetRow fabricates an empty row for an
+                                // unknown id and stores it in the sheet's row cache. Sources is only a
+                                // cache lookup so nothing throws here, but the cached empty row then
+                                // makes every later GetRowOrDefault for the same id return non-null,
+                                // and those callers do read Base. See GetRequiredFlag below.
+                                var reductionItem = _itemSheet.GetRowOrDefault(reductionIngredient.LinkedItemId.Value);
+                                if (reductionItem != null && reductionItem.Sources.Any())
                                 {
                                     foreach (var source in reductionItem.Sources)
                                     {
