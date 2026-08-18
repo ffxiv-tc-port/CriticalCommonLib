@@ -101,6 +101,16 @@ namespace CriticalCommonLib.Services
             _framework.RunOnFrameworkThread(() =>
             {
                 _gameInteropProvider.InitializeFromAttributes(this);
+                if (_containerInfoNetworkHook != null)
+                {
+                    // Grab a delegate straight to the original function address while the hook
+                    // object is still around - see the field comment for why the detour needs it.
+                    _containerInfoOriginal ??=
+                        System.Runtime.InteropServices.Marshal
+                            .GetDelegateForFunctionPointer<ContainerInfoNetworkData>(
+                                _containerInfoNetworkHook.Address);
+                }
+
                 _containerInfoNetworkHook?.Enable();
             });
             framework.Update += FrameworkOnUpdate;
@@ -418,6 +428,20 @@ namespace CriticalCommonLib.Services
         [Signature("48 89 74 24 ?? 57 48 81 EC ?? ?? ?? ?? 44 0F B7 42 ??", DetourName = nameof(ContainerInfoDetour), UseFlags = SignatureUseFlags.Hook)]
         private Hook<ContainerInfoNetworkData>? _containerInfoNetworkHook = null;
 
+        /// <summary>
+        /// Delegate pointing straight at the original function address (no trampoline).
+        /// Dispose() sets <see cref="_containerInfoNetworkHook"/> back to null, and the detour can
+        /// still be executing at that moment (in-flight call). Reading the field bare there throws
+        /// NullReferenceException straight back into native game code with the original never called.
+        /// Skipping the original is not an acceptable fallback either: this is a zone packet handler
+        /// returning void*, and we have no way of knowing what the game does with a null return.
+        /// Calling the raw address is safe precisely when the field is null - Hook.Dispose() runs
+        /// Disable() first, so the original bytes are already restored and there is no recursion
+        /// back into the detour. This is the same technique Dalamud itself uses in
+        /// Hook&lt;T&gt;.OriginalDisposeSafe.
+        /// </summary>
+        private ContainerInfoNetworkData? _containerInfoOriginal = null;
+
         private readonly HashSet<InventoryType> _loadedInventories = new();
 
         private unsafe void* ContainerInfoDetour(int seq, int* a3)
@@ -454,7 +478,19 @@ namespace CriticalCommonLib.Services
                 });
             }
 
-            return _containerInfoNetworkHook!.Original(seq, a3);
+            // Snapshot once - never read the field twice, and never dereference it bare.
+            var hook = _containerInfoNetworkHook;
+            var original = hook != null ? hook.OriginalDisposeSafe : _containerInfoOriginal;
+            if (original == null)
+            {
+                // Unreachable in practice: _containerInfoOriginal is assigned during startup,
+                // before the hook is enabled.
+                _pluginLog.Information(
+                    "ContainerInfo hook is gone mid-call and no original delegate is available; the packet was dropped.");
+                return null;
+            }
+
+            return original(seq, a3);
         }
 
         public void ParseBags()
