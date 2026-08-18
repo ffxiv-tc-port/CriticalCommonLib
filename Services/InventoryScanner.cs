@@ -1632,12 +1632,27 @@ namespace CriticalCommonLib.Services
         public unsafe void ParseGlamourChest(BagChangeContainer changeSet)
         {
             var agents = Framework.Instance()->UIModule->GetAgentModule();
-            var dresserAgent = (AgentMiragePrismPrismBox*)agents->GetAgentByInternalId(AgentId.MiragePrismPrismBox);
-            if (agents == null || dresserAgent == null || !dresserAgent->IsAgentActive())
+            if (agents == null)
             {
                 _glamourAgentActive = false;
                 return;
             }
+
+            var dresserAgent = (AgentMiragePrismPrismBox*)agents->GetAgentByInternalId(AgentId.MiragePrismPrismBox);
+            if (dresserAgent == null || !dresserAgent->IsAgentActive())
+            {
+                _glamourAgentActive = false;
+                return;
+            }
+
+            // IsAgentActive() 不保證 Data 已配置：代理人本體與它的資料區塊生命週期不同步。
+            // 每次重取、顯式判空、同幀即用；為 null 時安靜跳過這一次讀取，下一幀再試。
+            var dresserData = dresserAgent->Data;
+            if (dresserData == null)
+            {
+                return;
+            }
+
             if (!_glamourAgentActive && _glamourAgentOpened == null)
             {
                 _glamourAgentOpened = DateTime.Now + _glamourAgentWait;
@@ -1658,7 +1673,7 @@ namespace CriticalCommonLib.Services
 
             for (var i = 0; i < 8000; i++)
             {
-                var chestItem = dresserAgent->Data->PrismBoxItems[i];
+                var chestItem = dresserData->PrismBoxItems[i];
                 var itemId = chestItem.ItemId;
                 if (itemId >= 1_000_000)
                 {
@@ -1675,7 +1690,7 @@ namespace CriticalCommonLib.Services
 
             for (var i = 0; i < 8000; i++)
             {
-                var chestItem = dresserAgent->Data->PrismBoxItems[i];
+                var chestItem = dresserData->PrismBoxItems[i];
                 var flags = InventoryItem.ItemFlags.None;
                 var itemId = chestItem.ItemId;
                 if (itemId >= 1_000_000)
