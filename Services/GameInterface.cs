@@ -150,7 +150,22 @@ namespace CriticalCommonLib.Services
             itemId = itemId % 500_000;
             if (_recipeSheet.HasRecipesByItemId(itemId) && _itemSheet.BaseSheet.HasRow(itemId))
             {
-                _framework.RunOnFrameworkThread(() => { AgentRecipeNote.Instance()->SearchRecipeByItemId(itemId); });
+                // AgentRecipeNote.Instance() 是 [Agent(AgentId.RecipeNote)] 產生的兩層包裝
+                // （AgentModule.Instance() 為 null 回 null，否則回 GetAgentByInternalId(...)），
+                // 兩層都合法可為 null。原本直接解參考去呼叫 SearchRecipeByItemId()——那是
+                // [MemberFunction]，null 的 this 會直接進原生碼解參考，產生的
+                // AccessViolationException 在 .NET Core 屬於 corrupted-state exception，
+                // try/catch 攔不到。取不到就安靜跳過這次開窗（使用者再點一次即可）。
+                _framework.RunOnFrameworkThread(() =>
+                {
+                    var agentRecipeNote = AgentRecipeNote.Instance();
+                    if (agentRecipeNote == null)
+                    {
+                        return;
+                    }
+
+                    agentRecipeNote->SearchRecipeByItemId(itemId);
+                });
             }
 
             return true;
@@ -174,7 +189,18 @@ namespace CriticalCommonLib.Services
             itemId %= 500_000;
             if (_recipeSheet.HasRecipesByItemId(itemId) && _recipeSheet.BaseSheet.HasRow(recipeId))
             {
-                _framework.RunOnFrameworkThread(() => { AgentRecipeNote.Instance()->OpenRecipeByRecipeId(recipeId); });
+                // 同上一個多載：AgentRecipeNote.Instance() 兩層都合法可為 null，
+                // 取不到就安靜跳過這次開窗。
+                _framework.RunOnFrameworkThread(() =>
+                {
+                    var agentRecipeNote = AgentRecipeNote.Instance();
+                    if (agentRecipeNote == null)
+                    {
+                        return;
+                    }
+
+                    agentRecipeNote->OpenRecipeByRecipeId(recipeId);
+                });
             }
             return true;
         }

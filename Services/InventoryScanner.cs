@@ -1785,6 +1785,41 @@ namespace CriticalCommonLib.Services
                 _loadedInventories.Contains(InventoryType.RetainerMarket)
                )
             {
+                //Actual inventories
+                // GetInventoryContainer() 是 [MemberFunction]，容器尚未載入時回 null。
+                // 這一段原本取回十一個容器後完全不判空就 retainerEquippedItems->Size /
+                // retainerGil->Items[0] / retainerCrystal->Size / retainerMarketItems->Size /
+                // currentBag->Size 直接解參考，那是從位址 0 讀取，產生的
+                // AccessViolationException 在 .NET Core 屬於 corrupted-state exception，
+                // try/catch 攔不到。同檔的 ParseCharacterBags 對同一組取得方式本來就有
+                // 「六個容器全部非 null 才掃」的判空，這裡照抄同一個 fail-closed 語意。
+                //
+                // 取得與判空刻意放在 InMemoryRetainers/RetainerBagN 的記帳之前：任一容器取不到
+                // 就整個方法什麼都不做，效果與外層 _loadedInventories 閘門不成立時完全相同——
+                // 不會把「已在記憶體中」記上去卻只帶著一組全零的陣列給消費端，下一次掃描自然重試。
+                var retainerBag1 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage1);
+                var retainerBag2 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage2);
+                var retainerBag3 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage3);
+                var retainerBag4 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage4);
+                var retainerBag5 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage5);
+                var retainerBag6 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage6);
+                var retainerBag7 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage7);
+                var retainerEquippedItems =
+                    InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerEquippedItems);
+                var retainerMarketItems =
+                    InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerMarket);
+                var retainerGil = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerGil);
+                var retainerCrystal =
+                    InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerCrystals);
+
+                if (retainerBag1 == null || retainerBag2 == null || retainerBag3 == null || retainerBag4 == null ||
+                    retainerBag5 == null || retainerBag6 == null || retainerBag7 == null ||
+                    retainerEquippedItems == null || retainerMarketItems == null || retainerGil == null ||
+                    retainerCrystal == null)
+                {
+                    return;
+                }
+
                 if (!InMemoryRetainers.ContainsKey(currentRetainer))
                     InMemoryRetainers.Add(currentRetainer, new HashSet<InventoryType>());
                 InMemoryRetainers[currentRetainer].Add(InventoryType.RetainerPage1);
@@ -1819,21 +1854,6 @@ namespace CriticalCommonLib.Services
                         RetainerGil.Add(currentRetainer, new InventoryItem[1]);
                     if (!RetainerCrystals.ContainsKey(currentRetainer))
                         RetainerCrystals.Add(currentRetainer, new InventoryItem[18]);
-                    //Actual inventories
-                    var retainerBag1 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage1);
-                    var retainerBag2 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage2);
-                    var retainerBag3 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage3);
-                    var retainerBag4 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage4);
-                    var retainerBag5 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage5);
-                    var retainerBag6 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage6);
-                    var retainerBag7 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage7);
-                    var retainerEquippedItems =
-                        InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerEquippedItems);
-                    var retainerMarketItems =
-                        InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerMarket);
-                    var retainerGil = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerGil);
-                    var retainerCrystal =
-                        InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerCrystals);
 
                     RetainerSortOrder retainerInventory;
                     //Sort ordering
