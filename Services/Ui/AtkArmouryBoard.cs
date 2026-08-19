@@ -34,8 +34,26 @@ namespace CriticalCommonLib.Services.Ui
         {
             get
             {
-                var agent = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework
-                    .Instance()->UIModule->GetAgentModule()->GetAgentByInternalId(AgentId.ArmouryBoard);
+                // 原本是 Framework.Instance()->UIModule->GetAgentModule()->GetAgentByInternalId(...)
+                // 四層全裸，連最後拿到的 agent 都沒判空就 ->IsAgentActive()。
+                // Framework.Instance() 是 [StaticAddress(isPointer: true)] 可能回 null，UIModule 是
+                // 它的欄位也可能是 null，GetAgentModule() 是 [VirtualFunction(37)]、
+                // GetAgentByInternalId() 是 [MemberFunction]——null 的 this 會分別從位址 0 讀 vtable
+                // 與直接進原生碼解參考，兩者都是 try/catch 攔不到的 AccessViolationException。
+                // 改用判空版 AgentModule.Instance() 並補上 agent 判空；取不到就沿用原本
+                // 「代理人沒開著」的回傳值 -1。
+                var agentModule = AgentModule.Instance();
+                if (agentModule == null)
+                {
+                    return -1;
+                }
+
+                var agent = agentModule->GetAgentByInternalId(AgentId.ArmouryBoard);
+                if (agent == null)
+                {
+                    return -1;
+                }
+
                 if (agent->IsAgentActive())
                 {
                     var armouryAgent = (ArmouryBoard*) agent;

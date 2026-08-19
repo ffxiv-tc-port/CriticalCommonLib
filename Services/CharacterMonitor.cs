@@ -77,6 +77,32 @@ namespace CriticalCommonLib.Services
             }
         }
 
+        /// <summary>
+        /// 取得自由部隊的 InfoProxy，整條 Framework → UIModule → InfoModule 鏈都判空。
+        /// 原本寫成 Framework.Instance()-&gt;UIModule-&gt;GetInfoModule()-&gt;GetInfoProxyById(...)，
+        /// 三層全裸：Framework.Instance() 標的是 [StaticAddress(..., isPointer: true)]，那個位址
+        /// 存的是「指標的位址」，遊戲尚未初始化時讀出來就是 null；UIModule 是 Framework 的欄位，
+        /// UI 還沒建構時同樣是 null。而 GetInfoModule() 是 [VirtualFunction(35)]——this 為 null
+        /// 會從位址 0 讀 vtable；GetInfoProxyById() 是 [MemberFunction]——null 的 this 直接進到
+        /// 原生碼裡解參考。後兩者產生的 AccessViolationException 在 .NET Core 屬於
+        /// corrupted-state exception，try/catch 完全攔不到。
+        ///
+        /// InfoModule.Instance() 本身就是 FFXIVClientStructs 寫好的判空版本
+        /// (UIModule.Instance() 為 null 就回 null，而它又判過 Framework.Instance())，
+        /// 所以這裡只需要再擋 InfoModule 自己為 null 的情況。
+        /// 任一層取不到就安靜回 null——三個呼叫端本來就都有 infoProxy == null 的處理路徑，行為不變。
+        /// </summary>
+        private static unsafe InfoProxyInterface* GetFreeCompanyInfoProxy()
+        {
+            var infoModule = InfoModule.Instance();
+            if (infoModule == null)
+            {
+                return null;
+            }
+
+            return infoModule->GetInfoProxyById(InfoProxyId.FreeCompany);
+        }
+
         public unsafe void RefreshActiveCharacter()
         {
             if (_clientState.IsLoggedIn && _clientState.LocalPlayer != null && _clientState.LocalContentId != 0)
@@ -93,7 +119,7 @@ namespace CriticalCommonLib.Services
                     character.CharacterId = _clientState.LocalContentId;
                     _characters[character.CharacterId] = character;
                 }
-                var infoProxy = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework.Instance()->UIModule->GetInfoModule()->GetInfoProxyById(InfoProxyId.FreeCompany);
+                var infoProxy = GetFreeCompanyInfoProxy();
                 InfoProxyFreeCompany* freeCompanyInfoProxy = null;
                 if (infoProxy != null)
                 {
@@ -311,9 +337,12 @@ namespace CriticalCommonLib.Services
             {
                 unsafe
                 {
-                    var clientInterfaceUiModule = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework
-                        .Instance()->UIModule->GetItemOrderModule();
-                    var module = clientInterfaceUiModule;
+                    // 原本是 Framework.Instance()->UIModule->GetItemOrderModule()：Framework 與
+                    // 它的 UIModule 欄位都可能是 null，而 GetItemOrderModule() 是
+                    // [VirtualFunction(16)]，this 為 null 會從位址 0 讀 vtable，那是 try/catch
+                    // 攔不到的 AccessViolationException。改用 FFXIVClientStructs 寫好的判空版
+                    // ItemOrderModule.Instance()，取不到就沿用原本 module == null 的回傳值 0。
+                    var module = FFXIVClientStructs.FFXIV.Client.UI.Misc.ItemOrderModule.Instance();
                     if (module != null)
                     {
                         return module->ActiveRetainerId;
@@ -329,7 +358,7 @@ namespace CriticalCommonLib.Services
             {
                 unsafe
                 {
-                    var infoProxy = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework.Instance()->UIModule->GetInfoModule()->GetInfoProxyById(InfoProxyId.FreeCompany);
+                    var infoProxy = GetFreeCompanyInfoProxy();
                     if (infoProxy != null)
                     {
                         var freeCompanyInfoProxy = (InfoProxyFreeCompany*)infoProxy;
@@ -850,7 +879,7 @@ namespace CriticalCommonLib.Services
             if (_lastFreeCompanyUpdate.Value.AddSeconds(2) <= lastUpdateTime)
             {
                 _lastFreeCompanyUpdate = null;
-                var infoProxy = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework.Instance()->UIModule->GetInfoModule()->GetInfoProxyById(InfoProxyId.FreeCompany);
+                var infoProxy = GetFreeCompanyInfoProxy();
                 if (infoProxy != null)
                 {
                     var freeCompanyInfoProxy = (InfoProxyFreeCompany*)infoProxy;

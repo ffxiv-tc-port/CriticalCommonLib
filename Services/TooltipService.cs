@@ -38,15 +38,47 @@ namespace CriticalCommonLib.Services
 
             public DalamudLinkPayload? IdentifierPayload { get; set; }
 
+            /// <summary>
+            /// 取得道具提示的欄位陣列（NumberArrayData 30）。
+            /// RaptureAtkModule.Instance() 是判空版沒錯，但它仍會回 null（UIModule 尚未建構時），
+            /// 原本直接 -&gt;AtkArrayDataHolder 就是從位址 0 加偏移去讀；GetNumberArrayData() 是
+            /// 原生呼叫，該陣列還沒配置時也會回 null，原本又直接 -&gt;IntArray[...]。
+            /// 兩者產生的都是 AccessViolationException，在 .NET Core 屬於 corrupted-state
+            /// exception，try/catch 完全攔不到。取不到就回 null 由呼叫端 fail-closed。
+            /// </summary>
+            private static unsafe NumberArrayData* GetTooltipNumberArray()
+            {
+                var raptureAtkModule = RaptureAtkModule.Instance();
+                if (raptureAtkModule == null)
+                {
+                    return null;
+                }
+
+                return raptureAtkModule->AtkArrayDataHolder.GetNumberArrayData(30);
+            }
+
             protected unsafe bool GetTooltipVisibility(ItemTooltipFieldVisibility tooltipField)
             {
-                var flags = (ItemTooltipFieldVisibility)RaptureAtkModule.Instance()->AtkArrayDataHolder.GetNumberArrayData(30)->IntArray[5];
+                var numberArray = GetTooltipNumberArray();
+                if (numberArray == null)
+                {
+                    // 取不到就當作該欄位不可見：呼叫端據此跳過改寫提示內容，不會寫進不存在的欄位。
+                    return false;
+                }
+
+                var flags = (ItemTooltipFieldVisibility)numberArray->IntArray[5];
                 return flags.HasFlag(tooltipField);
             }
 
             protected unsafe bool GetTooltipVisibility(ItemTooltipField tooltipField)
             {
-                return RaptureAtkModule.Instance()->AtkArrayDataHolder.GetNumberArrayData(30)->IntArray[(int)tooltipField] == 0;
+                var numberArray = GetTooltipNumberArray();
+                if (numberArray == null)
+                {
+                    return false;
+                }
+
+                return numberArray->IntArray[(int)tooltipField] == 0;
             }
 
             public virtual unsafe void OnGenerateItemTooltip(NumberArrayData* numberArrayData,

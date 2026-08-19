@@ -1540,7 +1540,14 @@ namespace CriticalCommonLib.Services
 
                 if (!hasAgent)
                 {
-                    var agentFreeCompanyShop = AgentModule.Instance()->GetAgentByInternalId(AgentId.FreeCompanyCreditShop);
+                    // AgentModule.Instance() 自己會判空回 null，但這裡原本直接解參考它去呼叫
+                    // GetAgentByInternalId()——那是 [MemberFunction]，null 的 this 會直接進原生碼
+                    // 解參考，產生 try/catch 攔不到的 AccessViolationException。取不到就當作
+                    // 沒有 agent（hasAgent 維持 false），下面本來就有「無法掃描」的處理路徑。
+                    var agentModule = AgentModule.Instance();
+                    var agentFreeCompanyShop = agentModule == null
+                        ? null
+                        : agentModule->GetAgentByInternalId(AgentId.FreeCompanyCreditShop);
                     if (agentFreeCompanyShop != null && agentFreeCompanyShop->IsAgentActive() && agentFreeCompanyShop->AddonId != 0)
                     {
                         hasAgent = true;
@@ -1553,9 +1560,31 @@ namespace CriticalCommonLib.Services
                     InMemory.Remove((InventoryType)Enums.InventoryType.FreeCompanyCurrency);
                     return;
                 }
-                var atkDataHolder = Framework.Instance()->UIModule->GetRaptureAtkModule()->AtkModule
-                    .AtkArrayDataHolder;
+                // 原本是 Framework.Instance()->UIModule->GetRaptureAtkModule()->AtkModule
+                // .AtkArrayDataHolder：Framework.Instance() 是 [StaticAddress(isPointer: true)]
+                // 可能回 null，UIModule 是它的欄位也可能是 null，GetRaptureAtkModule() 是
+                // [VirtualFunction(7)]——this 為 null 會從位址 0 讀 vtable，那是 try/catch 攔不到的
+                // AccessViolationException。RaptureAtkModule.Instance() 是 FFXIVClientStructs
+                // 寫好的判空版本，只需再擋它回 null。
+                var raptureAtkModule = FFXIVClientStructs.FFXIV.Client.UI.RaptureAtkModule.Instance();
+                if (raptureAtkModule == null)
+                {
+                    _pluginLog.Verbose("Cannot scan free company currency as the atk module is not available.");
+                    InMemory.Remove((InventoryType)Enums.InventoryType.FreeCompanyCurrency);
+                    return;
+                }
+
+                var atkDataHolder = raptureAtkModule->AtkModule.AtkArrayDataHolder;
+                // GetNumberArrayData 是原生呼叫，該陣列尚未配置時會回 null；
+                // 原本直接解參考 fcHolder->IntArray[9]，同樣是攔不到的 AccessViolation。
                 var fcHolder = atkDataHolder.GetNumberArrayData(52);
+                if (fcHolder == null)
+                {
+                    _pluginLog.Verbose("Cannot scan free company currency as the number array is not available.");
+                    InMemory.Remove((InventoryType)Enums.InventoryType.FreeCompanyCurrency);
+                    return;
+                }
+
                 var fcCredit = fcHolder->IntArray[9];
                 var fcRank = fcHolder->IntArray[4];
                 if (fcRank == 0)
@@ -1631,7 +1660,12 @@ namespace CriticalCommonLib.Services
         private DateTime? _glamourAgentOpened;
         public unsafe void ParseGlamourChest(BagChangeContainer changeSet)
         {
-            var agents = Framework.Instance()->UIModule->GetAgentModule();
+            // 原本是 Framework.Instance()->UIModule->GetAgentModule()：只判了最後那層的結果，
+            // 前面兩層仍是裸讀。Framework.Instance() 是 [StaticAddress(isPointer: true)] 可能回
+            // null，UIModule 是它的欄位也可能是 null，而 GetAgentModule() 是 [VirtualFunction(37)]
+            // ——this 為 null 會從位址 0 讀 vtable，那是 try/catch 攔不到的 AccessViolationException。
+            // 改用判空版 AgentModule.Instance()，取不到就沿用原本 agents == null 的處理。
+            var agents = AgentModule.Instance();
             if (agents == null)
             {
                 _glamourAgentActive = false;

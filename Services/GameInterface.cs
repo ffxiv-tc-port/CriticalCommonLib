@@ -72,9 +72,19 @@ namespace CriticalCommonLib.Services
             _framework.RunOnFrameworkThread(() =>
             {
                 var itemIdShort = (ushort)(itemId % 500_000);
+                // 原本是 Framework.Instance()->UIModule->GetAgentModule()->GetAgentByInternalId(...)，
+                // 前三層全裸。Framework.Instance() 是 [StaticAddress(isPointer: true)] 可能回 null，
+                // UIModule 是它的欄位也可能是 null，GetAgentModule() 是 [VirtualFunction(37)]
+                // ——this 為 null 會從位址 0 讀 vtable，是 try/catch 攔不到的 AccessViolationException。
+                // AgentModule.Instance() 是 FFXIVClientStructs 寫好的判空版本，只需再擋它回 null。
+                var agentModule = AgentModule.Instance();
+                if (agentModule == null)
+                {
+                    return;
+                }
+
                 AgentGatheringNote* agent =
-                    (AgentGatheringNote*)Framework.Instance()->UIModule->GetAgentModule()->GetAgentByInternalId(
-                        AgentId.GatheringNote);
+                    (AgentGatheringNote*)agentModule->GetAgentByInternalId(AgentId.GatheringNote);
                 if (agent != null)
                 {
                     agent->OpenGatherableByItemId(itemIdShort);
@@ -87,9 +97,16 @@ namespace CriticalCommonLib.Services
             _framework.RunOnFrameworkThread(() =>
             {
                 var itemIdShort = (ushort)(itemId % 500_000);
+                // 同 OpenGatheringLog：原本三層全裸，改用判空版 AgentModule.Instance()，
+                // 取不到就安靜跳過這次開窗（使用者再點一次即可，沒有狀態被弄髒）。
+                var agentModule = AgentModule.Instance();
+                if (agentModule == null)
+                {
+                    return;
+                }
+
                 var agent =
-                    (AgentFishGuide*)Framework.Instance()->UIModule->GetAgentModule()->GetAgentByInternalId(
-                        AgentId.FishGuide);
+                    (AgentFishGuide*)agentModule->GetAgentByInternalId(AgentId.FishGuide);
                 if (agent != null)
                 {
                     agent->OpenForItemId(itemIdShort, isSpearfishing);

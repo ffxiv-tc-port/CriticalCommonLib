@@ -37,9 +37,22 @@ public class GameUiManager : IGameUiManager
 
     private unsafe void OnFrameworkUpdate(IFramework framework)
     {
+        // RaptureAtkModule.Instance() 會在 UIModule 尚未建構時回 null（它內部就是
+        // UIModule.Instance() == null ? null : ...）。原本直接 ->RaptureAtkUnitManager 等於
+        // 從位址 0 加偏移去讀，那是 AccessViolationException，在 .NET Core 屬於
+        // corrupted-state exception，try/catch 攔不到——而這裡是每幀都跑的 Framework.Update，
+        // 登入／登出過場正好是它為 null 的時候。
+        // 判空放在 _visibleUnits.Clear() 之前：取不到就整幀不做事、不動任何快取狀態，
+        // 下一幀自然重試，也不會誤送「視窗被關閉」事件。
+        var raptureAtkModule = RaptureAtkModule.Instance();
+        if (raptureAtkModule == null)
+        {
+            return;
+        }
+
         _visibleUnits.Clear();
 
-        foreach (var atkUnitBase in RaptureAtkModule.Instance()->RaptureAtkUnitManager.AtkUnitManager.AllLoadedUnitsList.Entries)
+        foreach (var atkUnitBase in raptureAtkModule->RaptureAtkUnitManager.AtkUnitManager.AllLoadedUnitsList.Entries)
         {
             if (atkUnitBase.Value != null && atkUnitBase.Value->IsReady && atkUnitBase.Value->IsVisible)
                 _visibleUnits.Add(atkUnitBase);
