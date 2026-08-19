@@ -96,8 +96,11 @@ public class GameUiManager : IGameUiManager
     }
 
     public unsafe T* GetNodeByID<T>(AtkUldManager uldManager, uint nodeId, NodeType? type = null) where T : unmanaged {
+        if (uldManager.NodeList == null) return null;
         for (var i = 0; i < uldManager.NodeListCount; i++) {
             var n = uldManager.NodeList[i];
+            // NodeListCount 只保證陣列長度，不保證元素非空；元素為 null 時解參考會直接 AVE（攔不到）。
+            if (n == null) continue;
             if (n->NodeId != nodeId || type != null && n->Type != type.Value) continue;
             return (T*)n;
         }
