@@ -6,6 +6,13 @@ namespace CriticalCommonLib.MarketBoard
 {
     public interface IMarketCache : IDisposable
     {
+        /// <summary>
+        /// 目前的服務區是否有線上市場資料來源(universalis)。台服(繁中服)為 false。
+        /// 為 false 時不會送出任何查價請求,顯示端應該把價格畫成「沒有資料」,而不是畫成 0
+        /// (會誤導)或永遠不會結束的「loading...」。
+        /// </summary>
+        bool MarketDataAvailable { get; }
+
         void LoadExistingCache();
         void ClearCache();
         void SaveCache(bool forceSave = false);
