@@ -15,6 +15,8 @@ namespace CriticalCommonLib.Services
     {
         private readonly IFramework _framework;
         private readonly IClientState _clientState;
+        private readonly IObjectTable _objectTable;
+        private readonly IPlayerState _playerState;
         private readonly TerritoryTypeSheet _territorySheet;
         private readonly Character.Factory _characterFactory;
         private readonly IPluginLog _pluginLog;
@@ -29,10 +31,12 @@ namespace CriticalCommonLib.Services
         private bool _isFreeCompanyLoaded;
         private bool _isHouseLoaded;
         private bool _initialCheck;
-        public CharacterMonitor(IFramework framework, IClientState clientState, TerritoryTypeSheet territorySheet, Character.Factory characterFactory, IPluginLog pluginLog)
+        public CharacterMonitor(IFramework framework, IClientState clientState, IObjectTable objectTable, IPlayerState playerState, TerritoryTypeSheet territorySheet, Character.Factory characterFactory, IPluginLog pluginLog)
         {
             _framework = framework;
             _clientState = clientState;
+            _objectTable = objectTable;
+            _playerState = playerState;
             _territorySheet = territorySheet;
             _characterFactory = characterFactory;
             _pluginLog = pluginLog;
@@ -59,7 +63,7 @@ namespace CriticalCommonLib.Services
         {
             get
             {
-                return _clientState.LocalContentId;
+                return _playerState.ContentId;
             }
         }
 
@@ -105,18 +109,18 @@ namespace CriticalCommonLib.Services
 
         public unsafe void RefreshActiveCharacter()
         {
-            if (_clientState.IsLoggedIn && _clientState.LocalPlayer != null && _clientState.LocalContentId != 0)
+            if (_clientState.IsLoggedIn && _objectTable.LocalPlayer != null && _playerState.ContentId != 0)
             {
-                _pluginLog.Verbose("CharacterMonitor: Character has changed to " + _clientState.LocalContentId);
+                _pluginLog.Verbose("CharacterMonitor: Character has changed to " + _playerState.ContentId);
                 Character character;
-                if (_characters.ContainsKey(_clientState.LocalContentId))
+                if (_characters.ContainsKey(_playerState.ContentId))
                 {
-                    character = _characters[_clientState.LocalContentId];
+                    character = _characters[_playerState.ContentId];
                 }
                 else
                 {
                     character = _characterFactory.Invoke();
-                    character.CharacterId = _clientState.LocalContentId;
+                    character.CharacterId = _playerState.ContentId;
                     _characters[character.CharacterId] = character;
                 }
                 var infoProxy = GetFreeCompanyInfoProxy();
@@ -126,7 +130,7 @@ namespace CriticalCommonLib.Services
                     freeCompanyInfoProxy = (InfoProxyFreeCompany*)infoProxy;
                 }
 
-                if (character.UpdateFromCurrentPlayer(_clientState.LocalPlayer, freeCompanyInfoProxy))
+                if (character.UpdateFromCurrentPlayer(_objectTable.LocalPlayer, freeCompanyInfoProxy))
                 {
                     _framework.RunOnFrameworkThread(() => { OnCharacterUpdated?.Invoke(character); });
                 }
@@ -379,7 +383,7 @@ namespace CriticalCommonLib.Services
                 unsafe
                 {
                     var housingManager = HousingManager.Instance();
-                    var character = _clientState.LocalPlayer;
+                    var character = _objectTable.LocalPlayer;
 
                     if (housingManager != null && character != null && housingManager->CurrentTerritory != null)
                     {
@@ -537,7 +541,7 @@ namespace CriticalCommonLib.Services
 
         private ulong ConvertHouseId(ulong gameHouseId)
         {
-            if (_clientState.LocalPlayer == null)
+            if (_objectTable.LocalPlayer == null)
             {
                 return 0;
             }
@@ -563,7 +567,7 @@ namespace CriticalCommonLib.Services
             }
             var zoneId = _territoryMap[territoryTypeId];
 
-            var worldId = _clientState.LocalPlayer.HomeWorld.RowId;
+            var worldId = _objectTable.LocalPlayer.HomeWorld.RowId;
             byte sb1 = (byte)wardId;
             byte sb2 = (byte)plotId;
             ushort sh1 = (ushort)roomId;
@@ -625,7 +629,7 @@ namespace CriticalCommonLib.Services
             return housingIds.Select(ConvertHouseId).Where(c => c != 0).ToList();
         }
 
-        public ulong InternalCharacterId => _clientState.LocalPlayer != null ? _clientState.LocalContentId : 0;
+        public ulong InternalCharacterId => _objectTable.LocalPlayer != null ? _playerState.ContentId : 0;
 
         public bool IsRetainerLoaded => _isRetainerLoaded;
         public ulong ActiveRetainerId => _activeRetainerId;
@@ -818,7 +822,7 @@ namespace CriticalCommonLib.Services
             {
                 return;
             }
-            if (_clientState.LocalPlayer == null || !retainerManager->IsReady)
+            if (_objectTable.LocalPlayer == null || !retainerManager->IsReady)
                 return;
             if (_lastRetainerCheck == null)
             {
@@ -830,7 +834,7 @@ namespace CriticalCommonLib.Services
                 _lastRetainerCheck = null;
                 var retainerList = retainerManager->Retainers;
                 var count = retainerManager->GetRetainerCount();
-                var currentCharacter = _clientState.LocalPlayer;
+                var currentCharacter = _objectTable.LocalPlayer;
                 if (currentCharacter != null)
                 {
                     for (var i = 0; i < retainerList.Length; i++)
@@ -853,7 +857,7 @@ namespace CriticalCommonLib.Services
                             if (character.UpdateFromRetainerInformation(retainerInformation, currentCharacter, i))
                             {
                                 _pluginLog.Debug("Retainer " + retainerInformation.RetainerId + " was updated.");
-                                character.OwnerId = _clientState.LocalContentId;
+                                character.OwnerId = _playerState.ContentId;
                                 _framework.RunOnFrameworkThread(() =>
                                 {
                                     OnCharacterUpdated?.Invoke(character);
@@ -869,7 +873,7 @@ namespace CriticalCommonLib.Services
         private unsafe void UpdateFreeCompany(DateTime lastUpdateTime)
         {
 
-            if (_clientState.LocalPlayer == null)
+            if (_objectTable.LocalPlayer == null)
                 return;
             if (_lastFreeCompanyUpdate == null)
             {
@@ -925,7 +929,7 @@ namespace CriticalCommonLib.Services
                 {
                     return _clientState.TerritoryType;
                 }
-                var character = _clientState.LocalPlayer;
+                var character = _objectTable.LocalPlayer;
 
                 if (character != null && housingManager->CurrentTerritory != null)
                 {
@@ -942,7 +946,7 @@ namespace CriticalCommonLib.Services
         private unsafe void UpdateHouses(DateTime lastUpdateTime)
         {
 
-            if (_clientState.LocalPlayer == null)
+            if (_objectTable.LocalPlayer == null)
                 return;
             if (_lastHouseUpdate == null)
             {
@@ -968,7 +972,7 @@ namespace CriticalCommonLib.Services
                         _characters[houseId] = character;
                     }
                     var housingManager = HousingManager.Instance();
-                    var internalCharacter = _clientState.LocalPlayer;
+                    var internalCharacter = _objectTable.LocalPlayer;
                     var territoryTypeId = CorrectedTerritoryTypeId;
                     if (!_territoryMap.ContainsKey(territoryTypeId))
                     {
@@ -984,7 +988,7 @@ namespace CriticalCommonLib.Services
 
                     if (housingManager != null && internalCharacter != null && territoryTypeId != 0)
                     {
-                        if (character.UpdateFromCurrentHouse(housingManager, internalCharacter, _clientState.LocalContentId, zoneId, territoryTypeId))
+                        if (character.UpdateFromCurrentHouse(housingManager, internalCharacter, _playerState.ContentId, zoneId, territoryTypeId))
                         {
                             _pluginLog.Debug("Free Company " + character.CharacterId + " was updated.");
                             _framework.RunOnFrameworkThread(() => { OnCharacterUpdated?.Invoke(character); });
@@ -1017,9 +1021,9 @@ namespace CriticalCommonLib.Services
         {
             get
             {
-                if (_clientState.IsLoggedIn && _clientState.LocalPlayer != null)
+                if (_clientState.IsLoggedIn && _objectTable.LocalPlayer != null)
                 {
-                    return _clientState.LocalPlayer?.ClassJob.RowId ?? null;
+                    return _objectTable.LocalPlayer?.ClassJob.RowId ?? null;
                 }
 
                 return null;

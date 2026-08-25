@@ -501,10 +501,10 @@ namespace CriticalCommonLib.Services
             }
             try
             {
-                if (_clientState.LocalContentId != 0 && _running)
+                if (_characterMonitor.LocalContentId != 0 && _running)
                 {
                     var changeSet = new BagChangeContainer();
-                    var inventorySortOrder = _odrScanner.GetSortOrder(_clientState.LocalContentId);
+                    var inventorySortOrder = _odrScanner.GetSortOrder(_characterMonitor.LocalContentId);
                     bool gearSetsChanged = false;
                     if (inventorySortOrder != null)
                     {
