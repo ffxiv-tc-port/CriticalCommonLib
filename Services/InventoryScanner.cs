@@ -101,6 +101,16 @@ namespace CriticalCommonLib.Services
             _framework.RunOnFrameworkThread(() =>
             {
                 _gameInteropProvider.InitializeFromAttributes(this);
+                if (_containerInfoNetworkHook != null)
+                {
+                    // Grab a delegate straight to the original function address while the hook
+                    // object is still around - see the field comment for why the detour needs it.
+                    _containerInfoOriginal ??=
+                        System.Runtime.InteropServices.Marshal
+                            .GetDelegateForFunctionPointer<ContainerInfoNetworkData>(
+                                _containerInfoNetworkHook.Address);
+                }
+
                 _containerInfoNetworkHook?.Enable();
             });
             framework.Update += FrameworkOnUpdate;
@@ -418,6 +428,20 @@ namespace CriticalCommonLib.Services
         [Signature("48 89 74 24 ?? 57 48 81 EC ?? ?? ?? ?? 44 0F B7 42 ??", DetourName = nameof(ContainerInfoDetour), UseFlags = SignatureUseFlags.Hook)]
         private Hook<ContainerInfoNetworkData>? _containerInfoNetworkHook = null;
 
+        /// <summary>
+        /// Delegate pointing straight at the original function address (no trampoline).
+        /// Dispose() sets <see cref="_containerInfoNetworkHook"/> back to null, and the detour can
+        /// still be executing at that moment (in-flight call). Reading the field bare there throws
+        /// NullReferenceException straight back into native game code with the original never called.
+        /// Skipping the original is not an acceptable fallback either: this is a zone packet handler
+        /// returning void*, and we have no way of knowing what the game does with a null return.
+        /// Calling the raw address is safe precisely when the field is null - Hook.Dispose() runs
+        /// Disable() first, so the original bytes are already restored and there is no recursion
+        /// back into the detour. This is the same technique Dalamud itself uses in
+        /// Hook&lt;T&gt;.OriginalDisposeSafe.
+        /// </summary>
+        private ContainerInfoNetworkData? _containerInfoOriginal = null;
+
         private readonly HashSet<InventoryType> _loadedInventories = new();
 
         private unsafe void* ContainerInfoDetour(int seq, int* a3)
@@ -454,7 +478,19 @@ namespace CriticalCommonLib.Services
                 });
             }
 
-            return _containerInfoNetworkHook!.Original(seq, a3);
+            // Snapshot once - never read the field twice, and never dereference it bare.
+            var hook = _containerInfoNetworkHook;
+            var original = hook != null ? hook.OriginalDisposeSafe : _containerInfoOriginal;
+            if (original == null)
+            {
+                // Unreachable in practice: _containerInfoOriginal is assigned during startup,
+                // before the hook is enabled.
+                _pluginLog.Information(
+                    "ContainerInfo hook is gone mid-call and no original delegate is available; the packet was dropped.");
+                return null;
+            }
+
+            return original(seq, a3);
         }
 
         public void ParseBags()
@@ -465,10 +501,10 @@ namespace CriticalCommonLib.Services
             }
             try
             {
-                if (_clientState.LocalContentId != 0 && _running)
+                if (_characterMonitor.LocalContentId != 0 && _running)
                 {
                     var changeSet = new BagChangeContainer();
-                    var inventorySortOrder = _odrScanner.GetSortOrder(_clientState.LocalContentId);
+                    var inventorySortOrder = _odrScanner.GetSortOrder(_characterMonitor.LocalContentId);
                     bool gearSetsChanged = false;
                     if (inventorySortOrder != null)
                     {
@@ -1504,7 +1540,14 @@ namespace CriticalCommonLib.Services
 
                 if (!hasAgent)
                 {
-                    var agentFreeCompanyShop = AgentModule.Instance()->GetAgentByInternalId(AgentId.FreeCompanyCreditShop);
+                    // AgentModule.Instance() 自己會判空回 null，但這裡原本直接解參考它去呼叫
+                    // GetAgentByInternalId()——那是 [MemberFunction]，null 的 this 會直接進原生碼
+                    // 解參考，產生 try/catch 攔不到的 AccessViolationException。取不到就當作
+                    // 沒有 agent（hasAgent 維持 false），下面本來就有「無法掃描」的處理路徑。
+                    var agentModule = AgentModule.Instance();
+                    var agentFreeCompanyShop = agentModule == null
+                        ? null
+                        : agentModule->GetAgentByInternalId(AgentId.FreeCompanyCreditShop);
                     if (agentFreeCompanyShop != null && agentFreeCompanyShop->IsAgentActive() && agentFreeCompanyShop->AddonId != 0)
                     {
                         hasAgent = true;
@@ -1517,9 +1560,31 @@ namespace CriticalCommonLib.Services
                     InMemory.Remove((InventoryType)Enums.InventoryType.FreeCompanyCurrency);
                     return;
                 }
-                var atkDataHolder = Framework.Instance()->UIModule->GetRaptureAtkModule()->AtkModule
-                    .AtkArrayDataHolder;
+                // 原本是 Framework.Instance()->UIModule->GetRaptureAtkModule()->AtkModule
+                // .AtkArrayDataHolder：Framework.Instance() 是 [StaticAddress(isPointer: true)]
+                // 可能回 null，UIModule 是它的欄位也可能是 null，GetRaptureAtkModule() 是
+                // [VirtualFunction(7)]——this 為 null 會從位址 0 讀 vtable，那是 try/catch 攔不到的
+                // AccessViolationException。RaptureAtkModule.Instance() 是 FFXIVClientStructs
+                // 寫好的判空版本，只需再擋它回 null。
+                var raptureAtkModule = FFXIVClientStructs.FFXIV.Client.UI.RaptureAtkModule.Instance();
+                if (raptureAtkModule == null)
+                {
+                    _pluginLog.Verbose("Cannot scan free company currency as the atk module is not available.");
+                    InMemory.Remove((InventoryType)Enums.InventoryType.FreeCompanyCurrency);
+                    return;
+                }
+
+                var atkDataHolder = raptureAtkModule->AtkModule.AtkArrayDataHolder;
+                // GetNumberArrayData 是原生呼叫，該陣列尚未配置時會回 null；
+                // 原本直接解參考 fcHolder->IntArray[9]，同樣是攔不到的 AccessViolation。
                 var fcHolder = atkDataHolder.GetNumberArrayData(52);
+                if (fcHolder == null)
+                {
+                    _pluginLog.Verbose("Cannot scan free company currency as the number array is not available.");
+                    InMemory.Remove((InventoryType)Enums.InventoryType.FreeCompanyCurrency);
+                    return;
+                }
+
                 var fcCredit = fcHolder->IntArray[9];
                 var fcRank = fcHolder->IntArray[4];
                 if (fcRank == 0)
@@ -1595,13 +1660,33 @@ namespace CriticalCommonLib.Services
         private DateTime? _glamourAgentOpened;
         public unsafe void ParseGlamourChest(BagChangeContainer changeSet)
         {
-            var agents = Framework.Instance()->UIModule->GetAgentModule();
-            var dresserAgent = (AgentMiragePrismPrismBox*)agents->GetAgentByInternalId(AgentId.MiragePrismPrismBox);
-            if (agents == null || dresserAgent == null || !dresserAgent->IsAgentActive())
+            // 原本是 Framework.Instance()->UIModule->GetAgentModule()：只判了最後那層的結果，
+            // 前面兩層仍是裸讀。Framework.Instance() 是 [StaticAddress(isPointer: true)] 可能回
+            // null，UIModule 是它的欄位也可能是 null，而 GetAgentModule() 是 [VirtualFunction(37)]
+            // ——this 為 null 會從位址 0 讀 vtable，那是 try/catch 攔不到的 AccessViolationException。
+            // 改用判空版 AgentModule.Instance()，取不到就沿用原本 agents == null 的處理。
+            var agents = AgentModule.Instance();
+            if (agents == null)
             {
                 _glamourAgentActive = false;
                 return;
             }
+
+            var dresserAgent = (AgentMiragePrismPrismBox*)agents->GetAgentByInternalId(AgentId.MiragePrismPrismBox);
+            if (dresserAgent == null || !dresserAgent->IsAgentActive())
+            {
+                _glamourAgentActive = false;
+                return;
+            }
+
+            // IsAgentActive() 不保證 Data 已配置：代理人本體與它的資料區塊生命週期不同步。
+            // 每次重取、顯式判空、同幀即用；為 null 時安靜跳過這一次讀取，下一幀再試。
+            var dresserData = dresserAgent->Data;
+            if (dresserData == null)
+            {
+                return;
+            }
+
             if (!_glamourAgentActive && _glamourAgentOpened == null)
             {
                 _glamourAgentOpened = DateTime.Now + _glamourAgentWait;
@@ -1622,7 +1707,7 @@ namespace CriticalCommonLib.Services
 
             for (var i = 0; i < 8000; i++)
             {
-                var chestItem = dresserAgent->Data->PrismBoxItems[i];
+                var chestItem = dresserData->PrismBoxItems[i];
                 var itemId = chestItem.ItemId;
                 if (itemId >= 1_000_000)
                 {
@@ -1639,7 +1724,7 @@ namespace CriticalCommonLib.Services
 
             for (var i = 0; i < 8000; i++)
             {
-                var chestItem = dresserAgent->Data->PrismBoxItems[i];
+                var chestItem = dresserData->PrismBoxItems[i];
                 var flags = InventoryItem.ItemFlags.None;
                 var itemId = chestItem.ItemId;
                 if (itemId >= 1_000_000)
@@ -1700,6 +1785,41 @@ namespace CriticalCommonLib.Services
                 _loadedInventories.Contains(InventoryType.RetainerMarket)
                )
             {
+                //Actual inventories
+                // GetInventoryContainer() 是 [MemberFunction]，容器尚未載入時回 null。
+                // 這一段原本取回十一個容器後完全不判空就 retainerEquippedItems->Size /
+                // retainerGil->Items[0] / retainerCrystal->Size / retainerMarketItems->Size /
+                // currentBag->Size 直接解參考，那是從位址 0 讀取，產生的
+                // AccessViolationException 在 .NET Core 屬於 corrupted-state exception，
+                // try/catch 攔不到。同檔的 ParseCharacterBags 對同一組取得方式本來就有
+                // 「六個容器全部非 null 才掃」的判空，這裡照抄同一個 fail-closed 語意。
+                //
+                // 取得與判空刻意放在 InMemoryRetainers/RetainerBagN 的記帳之前：任一容器取不到
+                // 就整個方法什麼都不做，效果與外層 _loadedInventories 閘門不成立時完全相同——
+                // 不會把「已在記憶體中」記上去卻只帶著一組全零的陣列給消費端，下一次掃描自然重試。
+                var retainerBag1 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage1);
+                var retainerBag2 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage2);
+                var retainerBag3 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage3);
+                var retainerBag4 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage4);
+                var retainerBag5 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage5);
+                var retainerBag6 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage6);
+                var retainerBag7 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage7);
+                var retainerEquippedItems =
+                    InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerEquippedItems);
+                var retainerMarketItems =
+                    InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerMarket);
+                var retainerGil = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerGil);
+                var retainerCrystal =
+                    InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerCrystals);
+
+                if (retainerBag1 == null || retainerBag2 == null || retainerBag3 == null || retainerBag4 == null ||
+                    retainerBag5 == null || retainerBag6 == null || retainerBag7 == null ||
+                    retainerEquippedItems == null || retainerMarketItems == null || retainerGil == null ||
+                    retainerCrystal == null)
+                {
+                    return;
+                }
+
                 if (!InMemoryRetainers.ContainsKey(currentRetainer))
                     InMemoryRetainers.Add(currentRetainer, new HashSet<InventoryType>());
                 InMemoryRetainers[currentRetainer].Add(InventoryType.RetainerPage1);
@@ -1734,21 +1854,6 @@ namespace CriticalCommonLib.Services
                         RetainerGil.Add(currentRetainer, new InventoryItem[1]);
                     if (!RetainerCrystals.ContainsKey(currentRetainer))
                         RetainerCrystals.Add(currentRetainer, new InventoryItem[18]);
-                    //Actual inventories
-                    var retainerBag1 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage1);
-                    var retainerBag2 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage2);
-                    var retainerBag3 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage3);
-                    var retainerBag4 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage4);
-                    var retainerBag5 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage5);
-                    var retainerBag6 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage6);
-                    var retainerBag7 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage7);
-                    var retainerEquippedItems =
-                        InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerEquippedItems);
-                    var retainerMarketItems =
-                        InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerMarket);
-                    var retainerGil = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerGil);
-                    var retainerCrystal =
-                        InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerCrystals);
 
                     RetainerSortOrder retainerInventory;
                     //Sort ordering

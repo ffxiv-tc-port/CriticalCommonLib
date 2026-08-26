@@ -14,8 +14,6 @@ using FFXIVClientStructs.Interop;
 
 public class GameUiManager : IGameUiManager
 {
-    private static readonly unsafe AtkStage* stage = AtkStage.Instance();
-
     private readonly HashSet<Pointer<AtkUnitBase>> _visibleUnits = new(256);
     private readonly HashSet<Pointer<AtkUnitBase>> _removedUnits = new(16);
     private readonly Dictionary<Pointer<AtkUnitBase>, string> _nameCache = new(256);
@@ -39,9 +37,22 @@ public class GameUiManager : IGameUiManager
 
     private unsafe void OnFrameworkUpdate(IFramework framework)
     {
+        // RaptureAtkModule.Instance() 會在 UIModule 尚未建構時回 null（它內部就是
+        // UIModule.Instance() == null ? null : ...）。原本直接 ->RaptureAtkUnitManager 等於
+        // 從位址 0 加偏移去讀，那是 AccessViolationException，在 .NET Core 屬於
+        // corrupted-state exception，try/catch 攔不到——而這裡是每幀都跑的 Framework.Update，
+        // 登入／登出過場正好是它為 null 的時候。
+        // 判空放在 _visibleUnits.Clear() 之前：取不到就整幀不做事、不動任何快取狀態，
+        // 下一幀自然重試，也不會誤送「視窗被關閉」事件。
+        var raptureAtkModule = RaptureAtkModule.Instance();
+        if (raptureAtkModule == null)
+        {
+            return;
+        }
+
         _visibleUnits.Clear();
 
-        foreach (var atkUnitBase in RaptureAtkModule.Instance()->RaptureAtkUnitManager.AtkUnitManager.AllLoadedUnitsList.Entries)
+        foreach (var atkUnitBase in raptureAtkModule->RaptureAtkUnitManager.AtkUnitManager.AllLoadedUnitsList.Entries)
         {
             if (atkUnitBase.Value != null && atkUnitBase.Value->IsReady && atkUnitBase.Value->IsVisible)
                 _visibleUnits.Add(atkUnitBase);
@@ -85,8 +96,11 @@ public class GameUiManager : IGameUiManager
     }
 
     public unsafe T* GetNodeByID<T>(AtkUldManager uldManager, uint nodeId, NodeType? type = null) where T : unmanaged {
+        if (uldManager.NodeList == null) return null;
         for (var i = 0; i < uldManager.NodeListCount; i++) {
             var n = uldManager.NodeList[i];
+            // NodeListCount 只保證陣列長度，不保證元素非空；元素為 null 時解參考會直接 AVE（攔不到）。
+            if (n == null) continue;
             if (n->NodeId != nodeId || type != null && n->Type != type.Value) continue;
             return (T*)n;
         }
@@ -139,12 +153,41 @@ public class GameUiManager : IGameUiManager
     {
         try
         {
-            var focusedUnitsList = &stage->RaptureAtkUnitManager->AtkUnitManager.FocusedUnitsList;
+            // AtkStage.Instance() 是 [StaticAddress(isPointer: true)]：產生的判空只擋特徵碼失配，
+            // 全域尚未初始化時會靜默回 null。原本存成 static readonly 欄位＝跨幀凍結指標，
+            // 一旦型別初始化當下取到 null 就永遠是 null。改成每次重查並判空。
+            var stage = AtkStage.Instance();
+            if (stage == null)
+            {
+                return false;
+            }
+
+            var raptureAtkUnitManager = stage->RaptureAtkUnitManager;
+            if (raptureAtkUnitManager == null)
+            {
+                return false;
+            }
+
+            var focusedUnitsList = &raptureAtkUnitManager->AtkUnitManager.FocusedUnitsList;
             var focusedAddonList = focusedUnitsList->Entries;
 
-            for (var i = 0; i < focusedAddonList.Length; i++)
+            // Entries 是固定 256 格的陣列，Count 才是實際筆數。
+            // 原本依 Length 掃描會走進未使用的 null 格再解參考 NameString，
+            // 那是 AccessViolationException，下面的 try/catch 攔不到。
+            var focusedCount = (int)focusedUnitsList->Count;
+            if (focusedCount > focusedAddonList.Length)
+            {
+                focusedCount = focusedAddonList.Length;
+            }
+
+            for (var i = 0; i < focusedCount; i++)
             {
                 var addon = focusedAddonList[i];
+                if (addon.Value == null)
+                {
+                    continue;
+                }
+
                 var addonName = addon.Value->NameString;
 
                 if (addonName == windowName)

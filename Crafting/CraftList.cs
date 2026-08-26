@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
+using System.Runtime.Serialization;
 using AllaganLib.GameSheets.Caches;
 using AllaganLib.GameSheets.ItemSources;
 using AllaganLib.GameSheets.Sheets;
@@ -776,6 +777,65 @@ namespace CriticalCommonLib.Crafting
             }
         }
 
+        /// <summary>
+        /// Drops craft list entries whose item id has no row on this client.
+        /// </summary>
+        /// <remarks>
+        /// This runs for every path that materialises a CraftList from JSON. Both the saved plugin
+        /// configuration and imported list share codes go through Newtonsoft with the Autofac contract
+        /// resolver, and both populate CraftItems directly, bypassing AddCraftItem - which is the only
+        /// add path that validates the id today. A list built on another region's client therefore
+        /// carries ids this client has no row for, and CraftItem.Item is the central accessor every
+        /// craft column reads, so a single such entry takes out the whole craft window.
+        ///
+        /// Removing the entry matches what AddCraftItem already does with an unresolvable id (it skips
+        /// it), and the entry could not have been rendered or calculated in any case.
+        /// </remarks>
+        [OnDeserialized]
+        internal void RemoveInvalidCraftItems(StreamingContext context)
+        {
+            var craftItems = this._craftItems;
+            if (craftItems == null || craftItems.Count == 0)
+            {
+                return;
+            }
+
+            // GetRowOrDefault rather than GetRow: GetRow would fabricate and cache a row for exactly the
+            // broken ids we are trying to detect, which would both defeat the check and poison the sheet.
+            var invalidItemIds = craftItems
+                .Where(c => this._itemSheet.GetRowOrDefault(c.ItemId) == null)
+                .Select(c => c.ItemId)
+                .Distinct()
+                .ToList();
+            if (invalidItemIds.Count == 0)
+            {
+                return;
+            }
+
+            this._craftItems = craftItems.Where(c => !invalidItemIds.Contains(c.ItemId)).ToList();
+
+            // Warning, not Debug: dropping entries the user saved or imported must not be silent, and
+            // the ids are named so the loss can be reported and traced back to the source list.
+            this._logger.LogWarning(
+                "Removed {Count} craft list item(s) that reference item ids with no row on this client: {ItemIds}. This normally means the list was created on a client for a different region.",
+                invalidItemIds.Count,
+                string.Join(", ", invalidItemIds));
+        }
+
+        /// <summary>
+        /// Whether an item id resolves to a row on this client.
+        /// </summary>
+        /// <remarks>
+        /// Ingredient preference linked item ids round trip through the saved configuration and can also
+        /// arrive from an imported list. The child craft items built from them are regenerated on every
+        /// list update, so they never pass through AddCraftItem's validation; this is the equivalent
+        /// gate for that path. GetRowOrDefault is used because GetRow caches a fabricated row.
+        /// </remarks>
+        private bool CanResolveItem(uint itemId)
+        {
+            return this._itemSheet.GetRowOrDefault(itemId) != null;
+        }
+
         [JsonProperty(ObjectCreationHandling = ObjectCreationHandling.Replace)]
         public Dictionary<uint, IngredientPreference> IngredientPreferences
         {
@@ -914,7 +974,16 @@ namespace CriticalCommonLib.Crafting
 
         public InventoryItem.ItemFlags GetRequiredFlag(uint itemId)
         {
-            var itemRow = _itemSheet.GetRow(itemId);
+            // This is reached with ingredient preference LinkedItem*Ids, which round trip through the
+            // saved list configuration and can name an item this client does not have. GetRow would
+            // hand back a fabricated empty row and cache it; IsCollectable resolves through a lookup
+            // dictionary so it would quietly answer false, but Base.CanBeHq below throws outright, and
+            // the cached empty row goes on to break unrelated GetRowOrDefault callers for the same id.
+            var itemRow = _itemSheet.GetRowOrDefault(itemId);
+            if (itemRow == null)
+            {
+                return InventoryItem.ItemFlags.None;
+            }
             if (itemRow.IsCollectable)
             {
                 return InventoryItem.ItemFlags.Collectable;
@@ -1573,8 +1642,13 @@ namespace CriticalCommonLib.Crafting
                         {
                             if (reductionIngredient.LinkedItemId != null)
                             {
-                                var reductionItem = _itemSheet.GetRow(reductionIngredient.LinkedItemId.Value);
-                                if (reductionItem.Sources.Any())
+                                // GetRowOrDefault, not GetRow: GetRow fabricates an empty row for an
+                                // unknown id and stores it in the sheet's row cache. Sources is only a
+                                // cache lookup so nothing throws here, but the cached empty row then
+                                // makes every later GetRowOrDefault for the same id return non-null,
+                                // and those callers do read Base. See GetRequiredFlag below.
+                                var reductionItem = _itemSheet.GetRowOrDefault(reductionIngredient.LinkedItemId.Value);
+                                if (reductionItem != null && reductionItem.Sources.Any())
                                 {
                                     foreach (var source in reductionItem.Sources)
                                     {
@@ -1701,41 +1775,53 @@ namespace CriticalCommonLib.Crafting
                                 return childCrafts;
                             }
 
-                            var childCraftItem = _craftItemFactory.Invoke();
-                            childCraftItem.ParentItem = craftItem;
-                            childCraftItem.FromRaw(ingredientPreference.LinkedItemId.Value, GetRequiredFlag(ingredientPreference.LinkedItemId.Value),
-                                (uint)Math.Ceiling(craftItem.QuantityRequired / (double)yield) * (uint)ingredientPreference.LinkedItemQuantity,
-                                (uint)Math.Ceiling(craftItem.QuantityNeeded / (double)yield) * (uint)ingredientPreference.LinkedItemQuantity);
-                            childCraftItem.ChildCrafts =
-                                this.CalculateChildCrafts(childCraftItem, spareIngredients, craftItem, depth + 1)
-                                    .OrderByDescending(c => c.RecipeId).ToList();
-                            childCrafts.Add(childCraftItem);
+                            // Skip a linked item this client has no row for: see CanResolveItem.
+                            if (this.CanResolveItem(ingredientPreference.LinkedItemId.Value))
+                            {
+                                var childCraftItem = _craftItemFactory.Invoke();
+                                childCraftItem.ParentItem = craftItem;
+                                childCraftItem.FromRaw(ingredientPreference.LinkedItemId.Value, GetRequiredFlag(ingredientPreference.LinkedItemId.Value),
+                                    (uint)Math.Ceiling(craftItem.QuantityRequired / (double)yield) * (uint)ingredientPreference.LinkedItemQuantity,
+                                    (uint)Math.Ceiling(craftItem.QuantityNeeded / (double)yield) * (uint)ingredientPreference.LinkedItemQuantity);
+                                childCraftItem.ChildCrafts =
+                                    this.CalculateChildCrafts(childCraftItem, spareIngredients, craftItem, depth + 1)
+                                        .OrderByDescending(c => c.RecipeId).ToList();
+                                childCrafts.Add(childCraftItem);
+                            }
                             if (ingredientPreference.LinkedItem2Id != null &&
                                 ingredientPreference.LinkedItem2Quantity != null)
                             {
-                                var secondChildCraftItem = _craftItemFactory.Invoke();
-                                secondChildCraftItem.ParentItem = craftItem;
-                                secondChildCraftItem.FromRaw(ingredientPreference.LinkedItem2Id.Value, GetRequiredFlag(ingredientPreference.LinkedItem2Id.Value),
-                                    craftItem.QuantityRequired * (uint)ingredientPreference.LinkedItem2Quantity,
-                                    craftItem.QuantityNeeded * (uint)ingredientPreference.LinkedItem2Quantity);
-                                secondChildCraftItem.ChildCrafts =
-                                    this.CalculateChildCrafts(secondChildCraftItem, spareIngredients, craftItem, depth + 1)
-                                        .OrderByDescending(c => c.RecipeId).ToList();
-                                childCrafts.Add(secondChildCraftItem);
+                                // Skip a linked item this client has no row for: see CanResolveItem.
+                                if (this.CanResolveItem(ingredientPreference.LinkedItem2Id.Value))
+                                {
+                                    var secondChildCraftItem = _craftItemFactory.Invoke();
+                                    secondChildCraftItem.ParentItem = craftItem;
+                                    secondChildCraftItem.FromRaw(ingredientPreference.LinkedItem2Id.Value, GetRequiredFlag(ingredientPreference.LinkedItem2Id.Value),
+                                        craftItem.QuantityRequired * (uint)ingredientPreference.LinkedItem2Quantity,
+                                        craftItem.QuantityNeeded * (uint)ingredientPreference.LinkedItem2Quantity);
+                                    secondChildCraftItem.ChildCrafts =
+                                        this.CalculateChildCrafts(secondChildCraftItem, spareIngredients, craftItem, depth + 1)
+                                            .OrderByDescending(c => c.RecipeId).ToList();
+                                    childCrafts.Add(secondChildCraftItem);
+                                }
                             }
 
                             if (ingredientPreference.LinkedItem3Id != null &&
                                 ingredientPreference.LinkedItem3Quantity != null)
                             {
-                                var thirdChildCraftItem = _craftItemFactory.Invoke();
-                                thirdChildCraftItem.ParentItem = craftItem;
-                                thirdChildCraftItem.FromRaw(ingredientPreference.LinkedItem3Id.Value, GetRequiredFlag(ingredientPreference.LinkedItem3Id.Value),
-                                    craftItem.QuantityRequired * (uint)ingredientPreference.LinkedItem3Quantity,
-                                    craftItem.QuantityNeeded * (uint)ingredientPreference.LinkedItem3Quantity);
-                                thirdChildCraftItem.ChildCrafts =
-                                    this.CalculateChildCrafts(thirdChildCraftItem, spareIngredients, craftItem, depth + 1)
-                                        .OrderByDescending(c => c.RecipeId).ToList();
-                                childCrafts.Add(thirdChildCraftItem);
+                                // Skip a linked item this client has no row for: see CanResolveItem.
+                                if (this.CanResolveItem(ingredientPreference.LinkedItem3Id.Value))
+                                {
+                                    var thirdChildCraftItem = _craftItemFactory.Invoke();
+                                    thirdChildCraftItem.ParentItem = craftItem;
+                                    thirdChildCraftItem.FromRaw(ingredientPreference.LinkedItem3Id.Value, GetRequiredFlag(ingredientPreference.LinkedItem3Id.Value),
+                                        craftItem.QuantityRequired * (uint)ingredientPreference.LinkedItem3Quantity,
+                                        craftItem.QuantityNeeded * (uint)ingredientPreference.LinkedItem3Quantity);
+                                    thirdChildCraftItem.ChildCrafts =
+                                        this.CalculateChildCrafts(thirdChildCraftItem, spareIngredients, craftItem, depth + 1)
+                                            .OrderByDescending(c => c.RecipeId).ToList();
+                                    childCrafts.Add(thirdChildCraftItem);
+                                }
                             }
                         }
 
@@ -1752,15 +1838,19 @@ namespace CriticalCommonLib.Crafting
                                 return childCrafts;
                             }
 
-                            var childCraftItem = _craftItemFactory.Invoke();
-                            childCraftItem.ParentItem = craftItem;
-                            childCraftItem.FromRaw(ingredientPreference.LinkedItemId.Value,GetRequiredFlag(ingredientPreference.LinkedItemId.Value),
-                                craftItem.QuantityRequired * (uint)ingredientPreference.LinkedItemQuantity,
-                                craftItem.QuantityNeeded * (uint)ingredientPreference.LinkedItemQuantity);
-                            childCraftItem.ChildCrafts =
-                                this.CalculateChildCrafts(childCraftItem, spareIngredients, craftItem, depth + 1)
-                                    .OrderByDescending(c => c.RecipeId).ToList();
-                            childCrafts.Add(childCraftItem);
+                            // Skip a linked item this client has no row for: see CanResolveItem.
+                            if (this.CanResolveItem(ingredientPreference.LinkedItemId.Value))
+                            {
+                                var childCraftItem = _craftItemFactory.Invoke();
+                                childCraftItem.ParentItem = craftItem;
+                                childCraftItem.FromRaw(ingredientPreference.LinkedItemId.Value,GetRequiredFlag(ingredientPreference.LinkedItemId.Value),
+                                    craftItem.QuantityRequired * (uint)ingredientPreference.LinkedItemQuantity,
+                                    craftItem.QuantityNeeded * (uint)ingredientPreference.LinkedItemQuantity);
+                                childCraftItem.ChildCrafts =
+                                    this.CalculateChildCrafts(childCraftItem, spareIngredients, craftItem, depth + 1)
+                                        .OrderByDescending(c => c.RecipeId).ToList();
+                                childCrafts.Add(childCraftItem);
+                            }
                         }
 
                         return childCrafts;
@@ -1770,15 +1860,19 @@ namespace CriticalCommonLib.Crafting
                         if (ingredientPreference.LinkedItemId != null &&
                             ingredientPreference.LinkedItemQuantity != null)
                         {
-                            var childCraftItem = _craftItemFactory.Invoke();
-                            childCraftItem.ParentItem = craftItem;
-                            childCraftItem.FromRaw(ingredientPreference.LinkedItemId.Value, GetRequiredFlag(ingredientPreference.LinkedItemId.Value),
-                                craftItem.QuantityRequired * (uint)ingredientPreference.LinkedItemQuantity,
-                                craftItem.QuantityNeeded * (uint)ingredientPreference.LinkedItemQuantity);
-                            childCraftItem.ChildCrafts =
-                                this.CalculateChildCrafts(childCraftItem, spareIngredients, craftItem, depth + 1)
-                                    .OrderByDescending(c => c.RecipeId).ToList();
-                            childCrafts.Add(childCraftItem);
+                            // Skip a linked item this client has no row for: see CanResolveItem.
+                            if (this.CanResolveItem(ingredientPreference.LinkedItemId.Value))
+                            {
+                                var childCraftItem = _craftItemFactory.Invoke();
+                                childCraftItem.ParentItem = craftItem;
+                                childCraftItem.FromRaw(ingredientPreference.LinkedItemId.Value, GetRequiredFlag(ingredientPreference.LinkedItemId.Value),
+                                    craftItem.QuantityRequired * (uint)ingredientPreference.LinkedItemQuantity,
+                                    craftItem.QuantityNeeded * (uint)ingredientPreference.LinkedItemQuantity);
+                                childCraftItem.ChildCrafts =
+                                    this.CalculateChildCrafts(childCraftItem, spareIngredients, craftItem, depth + 1)
+                                        .OrderByDescending(c => c.RecipeId).ToList();
+                                childCrafts.Add(childCraftItem);
+                            }
                         }
 
                         return childCrafts;

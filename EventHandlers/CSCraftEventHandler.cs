@@ -11,6 +11,13 @@ public unsafe struct CSCraftEventHandler
 
     public static CSCraftEventHandler* Instance()
     {
-        return (CSCraftEventHandler*)EventFramework.Instance()->GetCraftEventHandler();
+        var eventFramework = EventFramework.Instance();
+        if (eventFramework == null)
+        {
+            return null;
+        }
+
+        // GetCraftEventHandler() 本身也可能回 null,呼叫端 ClassJobService 已經判空。
+        return (CSCraftEventHandler*)eventFramework->GetCraftEventHandler();
     }
 }

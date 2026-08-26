@@ -18,17 +18,19 @@ namespace CriticalCommonLib.Crafting
         private IGameUiManager _gameUiManager;
         private readonly RecipeSheet _recipeSheet;
         private readonly IClientState _clientState;
+        private readonly IObjectTable _objectTable;
         private readonly IFramework _framework;
         private readonly IPluginLog _pluginLog;
         private readonly ClassJobService _classJobService;
         private readonly ExcelSheet<GathererCrafterLvAdjustTable> _adjustSheet;
         private readonly RecipeLevelTableSheet _recipeLevelTableSheet;
 
-        public CraftMonitor(IGameUiManager gameUiManager, RecipeSheet recipeSheet, IClientState clientState, IFramework framework, IPluginLog pluginLog, ClassJobService classJobService, ExcelSheet<GathererCrafterLvAdjustTable> adjustSheet, RecipeLevelTableSheet recipeLevelTableSheet)
+        public CraftMonitor(IGameUiManager gameUiManager, RecipeSheet recipeSheet, IClientState clientState, IObjectTable objectTable, IFramework framework, IPluginLog pluginLog, ClassJobService classJobService, ExcelSheet<GathererCrafterLvAdjustTable> adjustSheet, RecipeLevelTableSheet recipeLevelTableSheet)
         {
             this._gameUiManager = gameUiManager;
             this._recipeSheet = recipeSheet;
             _clientState = clientState;
+            _objectTable = objectTable;
             _framework = framework;
             _pluginLog = pluginLog;
             _classJobService = classJobService;
@@ -217,7 +219,7 @@ namespace CriticalCommonLib.Crafting
         private WindowName? _currentWindow;
 
 
-        public uint CraftType => (uint) (_clientState.LocalPlayer?.ClassJob.ValueNullable?.DohDolJobIndex ?? 0);
+        public uint CraftType => (uint) (_objectTable.LocalPlayer?.ClassJob.ValueNullable?.DohDolJobIndex ?? 0);
 
         public unsafe uint Recipe
         {

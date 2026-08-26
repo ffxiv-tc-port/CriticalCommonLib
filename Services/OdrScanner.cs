@@ -22,6 +22,7 @@ public class OdrScanner : IOdrScanner, IDisposable
     private readonly IPluginLog _pluginLog;
     private readonly IGameInteropProvider _gameInteropProvider;
     private readonly IClientState _clientState;
+    private readonly ICharacterMonitor _characterMonitor;
     private bool _initialBootCheck;
     private Hook<UserFileManager.UserFileEvent.Delegates.WriteFile>? _writeFileHook;
     private Hook<UserFileManager.UserFileEvent.Delegates.ReadFile>? _readFileHook;
@@ -31,12 +32,13 @@ public class OdrScanner : IOdrScanner, IDisposable
     public event SortOrderChangedDelegate? OnSortOrderChanged;
 
     public OdrScanner(IFramework framework, IPluginLog pluginLog, IGameInteropProvider gameInteropProvider,
-        IClientState clientState)
+        IClientState clientState, ICharacterMonitor characterMonitor)
     {
         _framework = framework;
         _pluginLog = pluginLog;
         _gameInteropProvider = gameInteropProvider;
         _clientState = clientState;
+        _characterMonitor = characterMonitor;
         _sortOrders = new Dictionary<ulong, InventorySortOrder>();
     }
 
@@ -104,7 +106,7 @@ public class OdrScanner : IOdrScanner, IDisposable
                         try
                         {
                             var sortOrder = ParseItemOrder(buffer, true);
-                            _sortOrders[_clientState.LocalContentId] = sortOrder;
+                            _sortOrders[_characterMonitor.LocalContentId] = sortOrder;
                             OnSortOrderChanged?.Invoke(sortOrder);
                             _pluginLog.Verbose("Parsed the ODR from memory after a read.");
                         }
@@ -138,7 +140,7 @@ public class OdrScanner : IOdrScanner, IDisposable
                     try
                     {
                         var sortOrder = ParseItemOrder(buffer);
-                        _sortOrders[_clientState.LocalContentId] = sortOrder;
+                        _sortOrders[_characterMonitor.LocalContentId] = sortOrder;
                         OnSortOrderChanged?.Invoke(sortOrder);
                         _pluginLog.Verbose("Parsed the ODR from memory after a write.");
                     }

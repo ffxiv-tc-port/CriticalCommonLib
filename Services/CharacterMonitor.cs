@@ -15,6 +15,8 @@ namespace CriticalCommonLib.Services
     {
         private readonly IFramework _framework;
         private readonly IClientState _clientState;
+        private readonly IObjectTable _objectTable;
+        private readonly IPlayerState _playerState;
         private readonly TerritoryTypeSheet _territorySheet;
         private readonly Character.Factory _characterFactory;
         private readonly IPluginLog _pluginLog;
@@ -29,10 +31,12 @@ namespace CriticalCommonLib.Services
         private bool _isFreeCompanyLoaded;
         private bool _isHouseLoaded;
         private bool _initialCheck;
-        public CharacterMonitor(IFramework framework, IClientState clientState, TerritoryTypeSheet territorySheet, Character.Factory characterFactory, IPluginLog pluginLog)
+        public CharacterMonitor(IFramework framework, IClientState clientState, IObjectTable objectTable, IPlayerState playerState, TerritoryTypeSheet territorySheet, Character.Factory characterFactory, IPluginLog pluginLog)
         {
             _framework = framework;
             _clientState = clientState;
+            _objectTable = objectTable;
+            _playerState = playerState;
             _territorySheet = territorySheet;
             _characterFactory = characterFactory;
             _pluginLog = pluginLog;
@@ -59,7 +63,7 @@ namespace CriticalCommonLib.Services
         {
             get
             {
-                return _clientState.LocalContentId;
+                return _playerState.ContentId;
             }
         }
 
@@ -77,30 +81,56 @@ namespace CriticalCommonLib.Services
             }
         }
 
+        /// <summary>
+        /// 取得自由部隊的 InfoProxy，整條 Framework → UIModule → InfoModule 鏈都判空。
+        /// 原本寫成 Framework.Instance()-&gt;UIModule-&gt;GetInfoModule()-&gt;GetInfoProxyById(...)，
+        /// 三層全裸：Framework.Instance() 標的是 [StaticAddress(..., isPointer: true)]，那個位址
+        /// 存的是「指標的位址」，遊戲尚未初始化時讀出來就是 null；UIModule 是 Framework 的欄位，
+        /// UI 還沒建構時同樣是 null。而 GetInfoModule() 是 [VirtualFunction(35)]——this 為 null
+        /// 會從位址 0 讀 vtable；GetInfoProxyById() 是 [MemberFunction]——null 的 this 直接進到
+        /// 原生碼裡解參考。後兩者產生的 AccessViolationException 在 .NET Core 屬於
+        /// corrupted-state exception，try/catch 完全攔不到。
+        ///
+        /// InfoModule.Instance() 本身就是 FFXIVClientStructs 寫好的判空版本
+        /// (UIModule.Instance() 為 null 就回 null，而它又判過 Framework.Instance())，
+        /// 所以這裡只需要再擋 InfoModule 自己為 null 的情況。
+        /// 任一層取不到就安靜回 null——三個呼叫端本來就都有 infoProxy == null 的處理路徑，行為不變。
+        /// </summary>
+        private static unsafe InfoProxyInterface* GetFreeCompanyInfoProxy()
+        {
+            var infoModule = InfoModule.Instance();
+            if (infoModule == null)
+            {
+                return null;
+            }
+
+            return infoModule->GetInfoProxyById(InfoProxyId.FreeCompany);
+        }
+
         public unsafe void RefreshActiveCharacter()
         {
-            if (_clientState.IsLoggedIn && _clientState.LocalPlayer != null && _clientState.LocalContentId != 0)
+            if (_clientState.IsLoggedIn && _objectTable.LocalPlayer != null && _playerState.ContentId != 0)
             {
-                _pluginLog.Verbose("CharacterMonitor: Character has changed to " + _clientState.LocalContentId);
+                _pluginLog.Verbose("CharacterMonitor: Character has changed to " + _playerState.ContentId);
                 Character character;
-                if (_characters.ContainsKey(_clientState.LocalContentId))
+                if (_characters.ContainsKey(_playerState.ContentId))
                 {
-                    character = _characters[_clientState.LocalContentId];
+                    character = _characters[_playerState.ContentId];
                 }
                 else
                 {
                     character = _characterFactory.Invoke();
-                    character.CharacterId = _clientState.LocalContentId;
+                    character.CharacterId = _playerState.ContentId;
                     _characters[character.CharacterId] = character;
                 }
-                var infoProxy = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework.Instance()->UIModule->GetInfoModule()->GetInfoProxyById(InfoProxyId.FreeCompany);
+                var infoProxy = GetFreeCompanyInfoProxy();
                 InfoProxyFreeCompany* freeCompanyInfoProxy = null;
                 if (infoProxy != null)
                 {
                     freeCompanyInfoProxy = (InfoProxyFreeCompany*)infoProxy;
                 }
 
-                if (character.UpdateFromCurrentPlayer(_clientState.LocalPlayer, freeCompanyInfoProxy))
+                if (character.UpdateFromCurrentPlayer(_objectTable.LocalPlayer, freeCompanyInfoProxy))
                 {
                     _framework.RunOnFrameworkThread(() => { OnCharacterUpdated?.Invoke(character); });
                 }
@@ -311,9 +341,12 @@ namespace CriticalCommonLib.Services
             {
                 unsafe
                 {
-                    var clientInterfaceUiModule = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework
-                        .Instance()->UIModule->GetItemOrderModule();
-                    var module = clientInterfaceUiModule;
+                    // 原本是 Framework.Instance()->UIModule->GetItemOrderModule()：Framework 與
+                    // 它的 UIModule 欄位都可能是 null，而 GetItemOrderModule() 是
+                    // [VirtualFunction(16)]，this 為 null 會從位址 0 讀 vtable，那是 try/catch
+                    // 攔不到的 AccessViolationException。改用 FFXIVClientStructs 寫好的判空版
+                    // ItemOrderModule.Instance()，取不到就沿用原本 module == null 的回傳值 0。
+                    var module = FFXIVClientStructs.FFXIV.Client.UI.Misc.ItemOrderModule.Instance();
                     if (module != null)
                     {
                         return module->ActiveRetainerId;
@@ -329,7 +362,7 @@ namespace CriticalCommonLib.Services
             {
                 unsafe
                 {
-                    var infoProxy = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework.Instance()->UIModule->GetInfoModule()->GetInfoProxyById(InfoProxyId.FreeCompany);
+                    var infoProxy = GetFreeCompanyInfoProxy();
                     if (infoProxy != null)
                     {
                         var freeCompanyInfoProxy = (InfoProxyFreeCompany*)infoProxy;
@@ -350,7 +383,7 @@ namespace CriticalCommonLib.Services
                 unsafe
                 {
                     var housingManager = HousingManager.Instance();
-                    var character = _clientState.LocalPlayer;
+                    var character = _objectTable.LocalPlayer;
 
                     if (housingManager != null && character != null && housingManager->CurrentTerritory != null)
                     {
@@ -508,7 +541,7 @@ namespace CriticalCommonLib.Services
 
         private ulong ConvertHouseId(ulong gameHouseId)
         {
-            if (_clientState.LocalPlayer == null)
+            if (_objectTable.LocalPlayer == null)
             {
                 return 0;
             }
@@ -534,7 +567,7 @@ namespace CriticalCommonLib.Services
             }
             var zoneId = _territoryMap[territoryTypeId];
 
-            var worldId = _clientState.LocalPlayer.HomeWorld.RowId;
+            var worldId = _objectTable.LocalPlayer.HomeWorld.RowId;
             byte sb1 = (byte)wardId;
             byte sb2 = (byte)plotId;
             ushort sh1 = (ushort)roomId;
@@ -596,7 +629,7 @@ namespace CriticalCommonLib.Services
             return housingIds.Select(ConvertHouseId).Where(c => c != 0).ToList();
         }
 
-        public ulong InternalCharacterId => _clientState.LocalPlayer != null ? _clientState.LocalContentId : 0;
+        public ulong InternalCharacterId => _objectTable.LocalPlayer != null ? _playerState.ContentId : 0;
 
         public bool IsRetainerLoaded => _isRetainerLoaded;
         public ulong ActiveRetainerId => _activeRetainerId;
@@ -789,7 +822,7 @@ namespace CriticalCommonLib.Services
             {
                 return;
             }
-            if (_clientState.LocalPlayer == null || !retainerManager->IsReady)
+            if (_objectTable.LocalPlayer == null || !retainerManager->IsReady)
                 return;
             if (_lastRetainerCheck == null)
             {
@@ -801,7 +834,7 @@ namespace CriticalCommonLib.Services
                 _lastRetainerCheck = null;
                 var retainerList = retainerManager->Retainers;
                 var count = retainerManager->GetRetainerCount();
-                var currentCharacter = _clientState.LocalPlayer;
+                var currentCharacter = _objectTable.LocalPlayer;
                 if (currentCharacter != null)
                 {
                     for (var i = 0; i < retainerList.Length; i++)
@@ -824,7 +857,7 @@ namespace CriticalCommonLib.Services
                             if (character.UpdateFromRetainerInformation(retainerInformation, currentCharacter, i))
                             {
                                 _pluginLog.Debug("Retainer " + retainerInformation.RetainerId + " was updated.");
-                                character.OwnerId = _clientState.LocalContentId;
+                                character.OwnerId = _playerState.ContentId;
                                 _framework.RunOnFrameworkThread(() =>
                                 {
                                     OnCharacterUpdated?.Invoke(character);
@@ -840,7 +873,7 @@ namespace CriticalCommonLib.Services
         private unsafe void UpdateFreeCompany(DateTime lastUpdateTime)
         {
 
-            if (_clientState.LocalPlayer == null)
+            if (_objectTable.LocalPlayer == null)
                 return;
             if (_lastFreeCompanyUpdate == null)
             {
@@ -850,7 +883,7 @@ namespace CriticalCommonLib.Services
             if (_lastFreeCompanyUpdate.Value.AddSeconds(2) <= lastUpdateTime)
             {
                 _lastFreeCompanyUpdate = null;
-                var infoProxy = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework.Instance()->UIModule->GetInfoModule()->GetInfoProxyById(InfoProxyId.FreeCompany);
+                var infoProxy = GetFreeCompanyInfoProxy();
                 if (infoProxy != null)
                 {
                     var freeCompanyInfoProxy = (InfoProxyFreeCompany*)infoProxy;
@@ -896,7 +929,7 @@ namespace CriticalCommonLib.Services
                 {
                     return _clientState.TerritoryType;
                 }
-                var character = _clientState.LocalPlayer;
+                var character = _objectTable.LocalPlayer;
 
                 if (character != null && housingManager->CurrentTerritory != null)
                 {
@@ -913,7 +946,7 @@ namespace CriticalCommonLib.Services
         private unsafe void UpdateHouses(DateTime lastUpdateTime)
         {
 
-            if (_clientState.LocalPlayer == null)
+            if (_objectTable.LocalPlayer == null)
                 return;
             if (_lastHouseUpdate == null)
             {
@@ -939,7 +972,7 @@ namespace CriticalCommonLib.Services
                         _characters[houseId] = character;
                     }
                     var housingManager = HousingManager.Instance();
-                    var internalCharacter = _clientState.LocalPlayer;
+                    var internalCharacter = _objectTable.LocalPlayer;
                     var territoryTypeId = CorrectedTerritoryTypeId;
                     if (!_territoryMap.ContainsKey(territoryTypeId))
                     {
@@ -955,7 +988,7 @@ namespace CriticalCommonLib.Services
 
                     if (housingManager != null && internalCharacter != null && territoryTypeId != 0)
                     {
-                        if (character.UpdateFromCurrentHouse(housingManager, internalCharacter, _clientState.LocalContentId, zoneId, territoryTypeId))
+                        if (character.UpdateFromCurrentHouse(housingManager, internalCharacter, _playerState.ContentId, zoneId, territoryTypeId))
                         {
                             _pluginLog.Debug("Free Company " + character.CharacterId + " was updated.");
                             _framework.RunOnFrameworkThread(() => { OnCharacterUpdated?.Invoke(character); });
@@ -988,9 +1021,9 @@ namespace CriticalCommonLib.Services
         {
             get
             {
-                if (_clientState.IsLoggedIn && _clientState.LocalPlayer != null)
+                if (_clientState.IsLoggedIn && _objectTable.LocalPlayer != null)
                 {
-                    return _clientState.LocalPlayer?.ClassJob.RowId ?? null;
+                    return _objectTable.LocalPlayer?.ClassJob.RowId ?? null;
                 }
 
                 return null;

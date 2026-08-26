@@ -134,7 +134,18 @@ namespace CriticalCommonLib.Services
 
         public unsafe void PrintGatheringMapLink(GatheringPointRow gatheringPoint)
         {
+            // AgentMap.Instance() 是 [Agent(AgentId.Map)] 由來源產生器產生的兩層包裝：
+            // AgentModule.Instance() 為 null 就回 null，否則回 GetAgentByInternalId(AgentId.Map)
+            // ——後者在代理人尚未建立時同樣回 null。所以這個回傳值是合法可為 null 的。
+            // 原本取回來就直接寫 instance->TempMapMarkerCount = 0，那是往位址 0 寫入，
+            // 產生的 AccessViolationException 在 .NET Core 屬於 corrupted-state exception，
+            // try/catch 攔不到。取不到就安靜跳過這次標記——地圖還沒準備好本來就沒有標記可放。
             var instance = AgentMap.Instance();
+            if (instance == null)
+            {
+                return;
+            }
+
             instance->TempMapMarkerCount = 0;
             instance->AddGatheringTempMarker((int)gatheringPoint.GatherMarkerX, (int)gatheringPoint.GatherMarkerY, gatheringPoint.GatheringPointBase.ExportedGatheringPoint.Base.Radius, (uint)gatheringPoint.GatheringPointBase.ExportedGatheringPoint.Icon, 4u, $"Lv. {gatheringPoint.GatheringPointBase.Base.GatheringLevel} {gatheringPoint.GatheringPointNameRow.Base.Singular.ExtractText().ToTitleCase()}");
             instance->OpenMap(gatheringPoint.Map.RowId, gatheringPoint.Map.Value.TerritoryType.RowId, null,MapType.GatheringLog);
@@ -142,7 +153,13 @@ namespace CriticalCommonLib.Services
 
         public unsafe void PrintGatheringMapLink(FishingSpotRow fishingSpotRow, FishParameterRow fishParameterRow)
         {
+            // 同上一個多載：AgentMap.Instance() 合法可為 null，取不到就安靜跳過這次標記。
             var instance = AgentMap.Instance();
+            if (instance == null)
+            {
+                return;
+            }
+
             instance->TempMapMarkerCount = 0;
             instance->AddGatheringTempMarker(fishingSpotRow.GatherMarkerX, fishingSpotRow.GatherMarkerY, fishingSpotRow.Base.Radius / 7, Icons.FishingIcon, 4u, $"Lv. {fishingSpotRow.Base.GatheringLevel} {fishParameterRow.Base.FishingRecordType.Value.Addon.Value.Text.ExtractText()}");
             instance->OpenMap(fishingSpotRow.Map.RowId, fishingSpotRow.Map.Value.TerritoryType.RowId, null,MapType.GatheringLog);
@@ -150,7 +167,13 @@ namespace CriticalCommonLib.Services
 
         public unsafe void PrintGatheringMapLink(SpearfishingNotebookRow spearfishingNotebookRow, SpearfishingItemRow spearfishingItemRow)
         {
+            // 同上兩個多載：AgentMap.Instance() 合法可為 null，取不到就安靜跳過這次標記。
             var instance = AgentMap.Instance();
+            if (instance == null)
+            {
+                return;
+            }
+
             instance->TempMapMarkerCount = 0;
             instance->AddGatheringTempMarker(spearfishingNotebookRow.GatherMarkerX, spearfishingNotebookRow.GatherMarkerY, spearfishingNotebookRow.Base.Radius / 7, Icons.Spearfishing, 4u, $"Lv. {spearfishingNotebookRow.Base.GatheringLevel} {spearfishingItemRow.FishRecordType}");
             instance->OpenMap(spearfishingNotebookRow.Map.RowId, spearfishingNotebookRow.Map.Value.TerritoryType.RowId, null,MapType.GatheringLog);

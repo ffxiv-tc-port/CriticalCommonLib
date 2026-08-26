@@ -47,8 +47,15 @@ namespace CriticalCommonLib.MarketBoard
 
         public int AutomaticSaveTime { get; set; } = 120;
 
-        public MarketCache(IUniversalis universalis, MediatorService? mediator, IDalamudPluginInterface pluginInterfaceService, MarketCacheConfiguration marketCacheConfiguration, BackgroundTaskQueue.Factory queueFactory, ExcelSheet<World> worldSheet, IPluginLog pluginLog, GameData gameData, ExcelSheet<Item> itemSheet)
+        /// <summary>
+        /// 目前服務區是否有 universalis 資料。台服(繁中服)為 false。建構時判定一次即可,
+        /// ClientLanguage 由 Dalamud 啟動參數決定,執行期不會變。
+        /// </summary>
+        public bool MarketDataAvailable { get; }
+
+        public MarketCache(IUniversalis universalis, MediatorService? mediator, IDalamudPluginInterface pluginInterfaceService, MarketCacheConfiguration marketCacheConfiguration, BackgroundTaskQueue.Factory queueFactory, ExcelSheet<World> worldSheet, IPluginLog pluginLog, GameData gameData, ExcelSheet<Item> itemSheet, IClientState clientState)
         {
+            MarketDataAvailable = UniversalisAvailability.IsSupportedRegion(clientState);
             _saveQueue = queueFactory.Invoke("Market Cache", 1);
             _universalis = universalis;
             _mediator = mediator;
@@ -240,7 +247,10 @@ namespace CriticalCommonLib.MarketBoard
         {
             if (_worldIds == null)
             {
-                _worldIds = _worldSheet.Where(c => c.IsPublic).Select(c => c.RowId).ToList();
+                // 台服(陸行鳥 DataCenter=151)現役 8 個世界(RowId 4028-4035)的官方 IsPublic
+                // 全部是 False。這個 overload 目前(2026-08)全艦隊沒有呼叫點,但保留 fix
+                // 以免未來有人接上這個 overload 卻在台服拿到空的世界清單。
+                _worldIds = _worldSheet.Where(c => c.IsPublic || (c.RowId >= 4028 && c.RowId <= 4035)).Select(c => c.RowId).ToList();
             }
 
             return GetPricing(itemId, _worldIds, forceCheck);
@@ -262,6 +272,15 @@ namespace CriticalCommonLib.MarketBoard
             {
                 marketPricing = _marketBoardCache[(itemId, worldId)];
                 return MarketCachePricingResult.Successful;
+            }
+
+            //台服(繁中服)沒有 universalis 資料來源:已經存在的快取(上面那段)照樣給,但不再
+            //排任何新的查價。回傳 Disabled 而不是 NoPricing,是為了讓顯示端拿到 null 而畫成
+            //「沒有資料」,不要畫成 0。
+            if (!MarketDataAvailable)
+            {
+                marketPricing = null;
+                return MarketCachePricingResult.Disabled;
             }
 
             //No pricing available
@@ -291,6 +310,12 @@ namespace CriticalCommonLib.MarketBoard
 
         public bool RequestCheck(uint itemId, uint worldId, bool forceCheck)
         {
+            if (!MarketDataAvailable)
+            {
+                //台服:沒有可查的線上資料來源,直接回報請求不成立。
+                return false;
+            }
+
             if (worldId == 0)
             {
                 return false;
