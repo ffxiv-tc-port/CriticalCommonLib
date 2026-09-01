@@ -2916,7 +2916,7 @@ namespace CriticalCommonLib.Crafting
                 return null;
             }
 
-            if (item.Base.IsCollectable && flags != InventoryItem.ItemFlags.Collectable)
+            if (item.IsCollectable && flags != InventoryItem.ItemFlags.Collectable)
             {
                 return null;
             }
