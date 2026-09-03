@@ -44,18 +44,20 @@ namespace CriticalCommonLib.MarketBoard
         private readonly Stopwatch _automaticSaveTimer = new();
         private readonly string? _cacheStorageLocation;
         private readonly BackgroundTaskQueue _saveQueue;
+        private readonly UniversalisAvailability _universalisAvailability;
 
         public int AutomaticSaveTime { get; set; } = 120;
 
         /// <summary>
-        /// 目前服務區是否有 universalis 資料。台服(繁中服)為 false。建構時判定一次即可,
-        /// ClientLanguage 由 Dalamud 啟動參數決定,執行期不會變。
+        /// 目前是否還有任何世界查得到 universalis 資料。判定細節在 UniversalisAvailability:
+        /// 預設樂觀為 true,只有實際被 universalis 回 404 的世界才會被排除。不再按客戶端
+        /// 語言一刀切——universalis 收得到台服(繁中服)8 個世界的資料。
         /// </summary>
-        public bool MarketDataAvailable { get; }
+        public bool MarketDataAvailable => _universalisAvailability.MarketDataAvailable;
 
-        public MarketCache(IUniversalis universalis, MediatorService? mediator, IDalamudPluginInterface pluginInterfaceService, MarketCacheConfiguration marketCacheConfiguration, BackgroundTaskQueue.Factory queueFactory, ExcelSheet<World> worldSheet, IPluginLog pluginLog, GameData gameData, ExcelSheet<Item> itemSheet, IClientState clientState)
+        public MarketCache(IUniversalis universalis, MediatorService? mediator, IDalamudPluginInterface pluginInterfaceService, MarketCacheConfiguration marketCacheConfiguration, BackgroundTaskQueue.Factory queueFactory, ExcelSheet<World> worldSheet, IPluginLog pluginLog, GameData gameData, ExcelSheet<Item> itemSheet, UniversalisAvailability universalisAvailability)
         {
-            MarketDataAvailable = UniversalisAvailability.IsSupportedRegion(clientState);
+            _universalisAvailability = universalisAvailability;
             _saveQueue = queueFactory.Invoke("Market Cache", 1);
             _universalis = universalis;
             _mediator = mediator;
@@ -274,10 +276,10 @@ namespace CriticalCommonLib.MarketBoard
                 return MarketCachePricingResult.Successful;
             }
 
-            //台服(繁中服)沒有 universalis 資料來源:已經存在的快取(上面那段)照樣給,但不再
-            //排任何新的查價。回傳 Disabled 而不是 NoPricing,是為了讓顯示端拿到 null 而畫成
-            //「沒有資料」,不要畫成 0。
-            if (!MarketDataAvailable)
+            //universalis 認不得這個世界(或還沒登入、worldId 為 0):已經存在的快取(上面那段)
+            //照樣給,但不再排任何新的查價。回傳 Disabled 而不是 NoPricing,是為了讓顯示端拿到
+            //null 而畫成「沒有資料」,不要畫成 0。
+            if (!_universalisAvailability.IsWorldSupported(worldId))
             {
                 marketPricing = null;
                 return MarketCachePricingResult.Disabled;
@@ -310,13 +312,9 @@ namespace CriticalCommonLib.MarketBoard
 
         public bool RequestCheck(uint itemId, uint worldId, bool forceCheck)
         {
-            if (!MarketDataAvailable)
-            {
-                //台服:沒有可查的線上資料來源,直接回報請求不成立。
-                return false;
-            }
-
-            if (worldId == 0)
+            //universalis 認不得這個世界(或還沒登入、worldId 為 0):沒有可查的線上資料來源,
+            //直接回報請求不成立。
+            if (!_universalisAvailability.IsWorldSupported(worldId))
             {
                 return false;
             }

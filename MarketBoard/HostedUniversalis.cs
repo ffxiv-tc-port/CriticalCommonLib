@@ -24,13 +24,14 @@ public class HostedUniversalis : BackgroundService, IUniversalis
     private readonly ExcelSheet<World> _worldSheet;
     private readonly IFramework _framework;
     private readonly IHostedUniversalisConfiguration _hostedUniversalisConfiguration;
+    private readonly UniversalisAvailability _universalisAvailability;
+    private readonly ConcurrentDictionary<uint, byte> _notFoundLoggedWorlds = new();
 
     /// <summary>
-    /// 目前客戶端所在的服務區是否有 universalis 資料。台服(繁中服)為 false,整條線上查價
-    /// 鏈路(排程、HTTP 請求、退避重試、錯誤紅字)全部不啟動。在建構時判定一次即可:
-    /// IClientState.ClientLanguage 由 Dalamud 啟動參數決定,執行期不會變。
+    /// 目前是否還有任何世界查得到 universalis 資料。判定細節在 UniversalisAvailability:
+    /// 依據 universalis 自己的世界清單逐個世界判定,不再按客戶端語言一刀切。
     /// </summary>
-    public bool MarketApiAvailable { get; }
+    public bool MarketApiAvailable => _universalisAvailability.MarketDataAvailable;
 
     public ILogger<HostedUniversalis> Logger { get; }
     public HttpClient HttpClient { get; }
@@ -44,27 +45,17 @@ public class HostedUniversalis : BackgroundService, IUniversalis
     public int QueuedCount => _queuedCount;
 
 
-    public HostedUniversalis(ILogger<HostedUniversalis> logger, UniversalisUserAgent userAgent, HttpClient httpClient, BackgroundTaskQueue.Factory taskQueueFactory, ExcelSheet<World> worldSheet, IFramework framework, IHostedUniversalisConfiguration hostedUniversalisConfiguration, IClientState clientState)
+    public HostedUniversalis(ILogger<HostedUniversalis> logger, UniversalisUserAgent userAgent, HttpClient httpClient, BackgroundTaskQueue.Factory taskQueueFactory, ExcelSheet<World> worldSheet, IFramework framework, IHostedUniversalisConfiguration hostedUniversalisConfiguration, UniversalisAvailability universalisAvailability)
     {
         _userAgent = userAgent;
         _worldSheet = worldSheet;
         _framework = framework;
         _hostedUniversalisConfiguration = hostedUniversalisConfiguration;
+        _universalisAvailability = universalisAvailability;
         Logger = logger;
         HttpClient = httpClient;
         httpClient.DefaultRequestHeaders.Add("User-Agent", $"AllaganTools/{_userAgent.PluginVersion}");
         UniversalisQueue = taskQueueFactory.Invoke("Universalis Queue", 1);
-        MarketApiAvailable = UniversalisAvailability.IsSupportedRegion(clientState);
-        if (!MarketApiAvailable)
-        {
-            // 只在載入時講一次,不要每幀/每次查價都印。使用者的 LogLevel 是 2(Information),
-            // 用 Information 才收得到。
-            Logger.LogInformation(
-                "偵測到繁體中文(台服)客戶端(ClientLanguage={ClientLanguage}),universalis 沒有台服的市場資料,已停用線上查價:不會送出任何 universalis 請求,也不會再出現 backing off 的錯誤訊息。",
-                (int)clientState.ClientLanguage);
-            return;
-        }
-
         _framework.Update += FrameworkOnUpdate;
     }
 
@@ -92,13 +83,51 @@ public class HostedUniversalis : BackgroundService, IUniversalis
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        if (!MarketApiAvailable)
-        {
-            // 台服:佇列永遠不會有東西進來,連背景排空迴圈都不用起。
-            return;
-        }
-
+        await LoadKnownWorldsAsync(stoppingToken);
         await BackgroundProcessing(stoppingToken);
+    }
+
+    /// <summary>
+    /// 取一次 universalis 認得的世界清單,拿它當「這個世界查不查得到」的判準。
+    /// 取不到就什麼都不做:UniversalisAvailability 會維持樂觀模式照樣送請求,
+    /// 行為與改動前相同。
+    /// </summary>
+    private async Task LoadKnownWorldsAsync(CancellationToken token)
+    {
+        try
+        {
+            var response = await HttpClient.GetAsync("https://universalis.app/api/v2/worlds", token);
+            if (!response.IsSuccessStatusCode)
+            {
+                Logger.LogInformation(
+                    "取得 universalis 世界清單失敗(HTTP {StatusCode}),本次改用樂觀模式:照樣送出查價請求。",
+                    (int)response.StatusCode);
+                return;
+            }
+
+            var value = await response.Content.ReadAsStringAsync(token);
+            var worlds = JsonConvert.DeserializeObject<List<UniversalisWorld>>(value);
+            if (worlds == null || worlds.Count == 0)
+            {
+                Logger.LogInformation(
+                    "universalis 世界清單解析不出內容,本次改用樂觀模式:照樣送出查價請求。");
+                return;
+            }
+
+            _universalisAvailability.SetKnownWorlds(worlds.Select(c => c.id));
+            Logger.LogInformation(
+                "universalis 認得 {Count} 個世界,查價會依這份清單過濾。",
+                worlds.Count);
+        }
+        catch (TaskCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            Logger.LogInformation(
+                ex,
+                "取得 universalis 世界清單時發生例外,本次改用樂觀模式:照樣送出查價請求。");
+        }
     }
 
     private async Task BackgroundProcessing(CancellationToken stoppingToken)
@@ -131,13 +160,9 @@ public class HostedUniversalis : BackgroundService, IUniversalis
 
     public void QueuePriceCheck(uint itemId, uint worldId)
     {
-        if (!MarketApiAvailable)
-        {
-            // 台服:直接丟掉,不排程也不記錄(這個方法會被表格的每列呼叫,記 log 會洗版)。
-            return;
-        }
-
-        if (worldId == 0)
+        // universalis 認不得的世界(以及還沒登入、拿不到世界時的 worldId 0)直接丟掉,
+        // 不排程也不記錄(這個方法會被表格的每一列呼叫,記 log 會洗版)。
+        if (!_universalisAvailability.IsWorldSupported(worldId))
         {
             return;
         }
@@ -157,22 +182,20 @@ public class HostedUniversalis : BackgroundService, IUniversalis
 
     public async Task RetrieveMarketBoardPrices(IEnumerable<uint> itemIds, uint worldId, CancellationToken token,uint attempt = 0)
     {
-        if (!MarketApiAvailable)
-        {
-            // 台服:即使有人直接呼叫這個公開方法(繞過 QueuePriceCheck),也不送出請求。
-            return;
-        }
-
         if (token.IsCancellationRequested)
         {
             return;
         }
 
-        if (worldId == 0)
+        var itemIdList = itemIds.ToList();
+
+        // universalis 認不得的世界(以及 worldId 0)不送出請求。即使有人直接呼叫這個
+        // 公開方法繞過 QueuePriceCheck 也一樣。
+        if (!_universalisAvailability.IsWorldSupported(worldId))
         {
+            _queuedCount -= itemIdList.Count;
             return;
         }
-        var itemIdList = itemIds.ToList();
         if (attempt == MaxRetries)
         {
             _queuedCount -= itemIdList.Count;
@@ -220,6 +243,22 @@ public class HostedUniversalis : BackgroundService, IUniversalis
             }
 
             TooManyRequests = false;
+
+            if (response.StatusCode == HttpStatusCode.NotFound)
+            {
+                // universalis 對「這批道具它一個都不認得」也回 404(不可交易的道具就會這樣),
+                // 世界本身不一定有問題,所以這裡不動世界的可用性判定。這不是暫時性錯誤,重試
+                // 不會變好,所以不進退避重試、也不印紅字,每個世界只寫一次 Information。
+                if (_notFoundLoggedWorlds.TryAdd(worldId, default))
+                {
+                    Logger.LogInformation(
+                        "universalis 對世界「{WorldName}」(id {WorldId})的查價回了 404(通常是該批道具不可交易或它不認得),已跳過,不重試。",
+                        worldName, worldId);
+                }
+
+                _queuedCount -= itemIdList.Count;
+                return;
+            }
 
             var value = await response.Content.ReadAsStringAsync(token);
 
@@ -318,4 +357,15 @@ public class HostedUniversalis : BackgroundService, IUniversalis
         base.Dispose();
         GC.SuppressFinalize(this);
     }
+}
+
+/// <summary>
+/// universalis /api/v2/worlds 的一筆世界。欄位名刻意照 API 的小寫拼法,與這個資料夾裡
+/// 其他的 API 回應型別(PricingAPIResponse 等)一致。
+/// </summary>
+public class UniversalisWorld
+{
+    public uint id { get; set; }
+
+    public string? name { get; set; }
 }
