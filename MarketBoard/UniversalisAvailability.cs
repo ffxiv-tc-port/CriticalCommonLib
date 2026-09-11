@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 
 namespace CriticalCommonLib.MarketBoard
 {
@@ -38,6 +39,48 @@ namespace CriticalCommonLib.MarketBoard
         private readonly ConcurrentDictionary<uint, byte> _queriedUnsupported = new();
 
         /// <summary>
+        /// 使用者指定「不要查價」的世界。與上面那份 universalis 世界清單是兩回事:
+        /// 那份回答「對方認不認得這個世界」,這份回答「我們要不要查」。
+        /// 台服的拉姆(RowId 4034)已停止營運,但它在 World 表與 universalis 的世界
+        /// 清單裡都還在,所以只靠上面兩個判準攔不住,必須由使用者設定這一層擋。
+        /// null 代表還沒灌進來(等同沒有任何世界被排除)。
+        /// </summary>
+        private volatile HashSet<uint>? _excludedWorldIds;
+
+        private int _exclusionRevision;
+
+        /// <summary>
+        /// 排除清單的版次。有快取世界清單的顯示端拿它判「要不要重算」——排除清單改了
+        /// 之後若不重算,使用者會看到「勾了卻沒有變化」直到重開外掛。
+        /// </summary>
+        public int ExclusionRevision => Volatile.Read(ref _exclusionRevision);
+
+        /// <summary>
+        /// 灌入使用者的排除清單。空清單是合法的(代表全部都要查),所以這裡刻意不像
+        /// SetKnownWorlds 那樣忽略空集合——忽略的話使用者就永遠清不掉排除清單。
+        /// </summary>
+        public void SetExcludedWorlds(IEnumerable<uint> worldIds)
+        {
+            _excludedWorldIds = new HashSet<uint>(worldIds);
+            Interlocked.Increment(ref _exclusionRevision);
+        }
+
+        /// <summary>
+        /// 這個世界是不是被使用者排除了。
+        /// </summary>
+        public bool IsWorldExcluded(uint worldId)
+        {
+            var excluded = _excludedWorldIds;
+            return excluded != null && excluded.Contains(worldId);
+        }
+
+        /// <summary>
+        /// 目前被排除的世界,給顯示端與診斷用。
+        /// </summary>
+        public IReadOnlyList<uint> ExcludedWorlds => _excludedWorldIds?.ToList() ?? new List<uint>();
+
+
+        /// <summary>
         /// 世界清單是否已經取到。
         /// </summary>
         public bool WorldListLoaded => _knownWorldIds != null;
@@ -65,6 +108,15 @@ namespace CriticalCommonLib.MarketBoard
         public bool IsWorldSupported(uint worldId)
         {
             if (worldId == 0)
+            {
+                return false;
+            }
+
+            // 使用者排除的世界:直接不支援,而且刻意「不」記進 _queriedSupported /
+            // _queriedUnsupported。那兩份是給 MarketDataAvailable 判「這個客戶端到底有沒有
+            // 線上市場資料可用」的,把使用者自己的選擇混進去,會讓「排掉唯一問過的世界」
+            // 變成「整個市場功能沒有資料」,顯示端就會把別的世界的載入中畫成沒有資料。
+            if (IsWorldExcluded(worldId))
             {
                 return false;
             }
