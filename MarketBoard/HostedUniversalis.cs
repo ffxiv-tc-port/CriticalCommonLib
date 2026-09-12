@@ -330,6 +330,108 @@ public class HostedUniversalis : BackgroundService, IUniversalis
     /// 現在改成先看 HTTP 狀態碼,再用這個守衛擋「狀態碼是 2xx 但內容不是 JSON」
     /// (快取層/代理塞回錯誤頁的情況),永遠不會再拿非 JSON 去餵解析器。
     /// </summary>
+    /// <summary>
+    /// 一批道具最多取回幾筆成交紀錄。
+    ///
+    /// 📌 刻意維持 20 —— 改動前主端點帶的就是 entries=20,換成兩個請求之後
+    ///    沿用同一個上限,畫面上的「N 日成交數」與提示裡的成交清單長度才不會變。
+    /// </summary>
+    private const int HistoryEntriesToReturn = 20;
+
+    private readonly ConcurrentDictionary<uint, byte> _historyUnavailableLoggedWorlds = new();
+
+    /// <summary>
+    /// 查這一批道具的成交歷史,填進各自的 <c>recentHistory</c>。
+    ///
+    /// ⚠️ 這支不擲例外、也不動世界的可用性判定與重試計數:成交歷史只餵
+    ///    「N 日成交數」與「最後成交日期」,拿不到的代價是那兩個值留空,
+    ///    價格本身照樣送得出去。把它併進主請求的失敗處理會讓價格一起掉。
+    /// </summary>
+    private async Task MergeRecentHistoryAsync(List<PricingAPIResponse> pricings, string itemIdsString,
+        int itemCount, uint worldId, string worldName, CancellationToken token)
+    {
+        if (pricings.Count == 0 || token.IsCancellationRequested)
+        {
+            return;
+        }
+
+        // entriesWithin 讓時間窗對上使用者設定的天數,否則這個端點只給大約 7 天,
+        // 把上限調到 7 天以上的人會拿到偏少的成交數。
+        var withinSeconds = Math.Max(1, _hostedUniversalisConfiguration.SaleHistoryLimit) * 86400L;
+        var url = $"https://universalis.app/api/v2/history/{worldName}/{itemIdsString}"
+                  + $"?entriesWithin={withinSeconds}&entriesToReturn={HistoryEntriesToReturn}";
+
+        try
+        {
+            var response = await HttpClient.GetAsync(url, token);
+            if (!response.IsSuccessStatusCode)
+            {
+                ReportHistoryUnavailable(worldId, worldName, ((int)response.StatusCode).ToString());
+                return;
+            }
+
+            var value = await response.Content.ReadAsStringAsync(token);
+            if (!LooksLikeJson(value))
+            {
+                ReportHistoryUnavailable(worldId, worldName, Snippet(value));
+                return;
+            }
+
+            var byItem = new Dictionary<uint, RecentHistory[]?>();
+            if (itemCount == 1)
+            {
+                var single = JsonConvert.DeserializeObject<HistoryAPIResponse>(value);
+                if (single != null)
+                {
+                    byItem[single.itemID] = single.entries;
+                }
+            }
+            else
+            {
+                var multi = JsonConvert.DeserializeObject<HistoryMultiRequest>(value);
+                if (multi?.items != null)
+                {
+                    foreach (var entry in multi.items.Values)
+                    {
+                        byItem[entry.itemID] = entry.entries;
+                    }
+                }
+            }
+
+            foreach (var pricing in pricings)
+            {
+                // 沒有成交資料的道具會整筆缺席,那不是錯誤 —— 留 null 讓
+                // MarketPricing 走「沒有歷史」那條路。
+                if (byItem.TryGetValue(pricing.itemID, out var entries))
+                {
+                    pricing.recentHistory = entries;
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // 關閉/登出,或 HttpClient 自己逾時。成交歷史不是必需品。
+        }
+        catch (HttpRequestException ex)
+        {
+            ReportHistoryUnavailable(worldId, worldName, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// 每個世界只提醒一次,避免變成另一種形式的洗版。
+    /// </summary>
+    private void ReportHistoryUnavailable(uint worldId, string worldName, string reason)
+    {
+        if (_historyUnavailableLoggedWorlds.TryAdd(worldId, default))
+        {
+            Logger.LogInformation(
+                "universalis 對世界「{WorldName}」(id {WorldId})的成交歷史查不到({Reason})。"
+                + "價格與掛售不受影響,只有「N 日成交數」與最後成交日期會是空的。每個世界只提醒一次。",
+                worldName, worldId, reason);
+        }
+    }
+
     private static bool LooksLikeJson(string? value)
     {
         if (string.IsNullOrEmpty(value))
@@ -467,8 +569,13 @@ public class HostedUniversalis : BackgroundService, IUniversalis
 
         var itemIdsString = String.Join(",", itemIdList.Select(c => c.ToString()).ToArray());
         Logger.LogTrace("Sending request for items {ItemIds} to universalis API.", itemIdsString);
+
+        // 🔴 entries=0 是修好 504 的那一個參數,而且成本是二元的:對方只要被要求
+        //    附成交歷史就得去算,算的成本與要幾筆無關(entries=5 與 entries=20
+        //    一樣慢),而 listings 只影響回應大小、不影響耗時。
+        //    成交歷史改由 RetrieveRecentHistoryAsync 打專用端點取得。
         string url =
-            $"https://universalis.app/api/v2/{worldName}/{itemIdsString}?listings=20&entries=20";
+            $"https://universalis.app/api/v2/{worldName}/{itemIdsString}?listings=20&entries=0";
         try
         {
             var response = await HttpClient.GetAsync(url, token);
@@ -530,6 +637,7 @@ public class HostedUniversalis : BackgroundService, IUniversalis
                 return;
             }
 
+            List<PricingAPIResponse> pricings;
             if (itemIdList.Count == 1)
             {
                 PricingAPIResponse? apiListing = JsonConvert.DeserializeObject<PricingAPIResponse>(value);
@@ -541,10 +649,7 @@ public class HostedUniversalis : BackgroundService, IUniversalis
                     return;
                 }
 
-                var listing = MarketPricing.FromApi(apiListing, worldId,
-                    _hostedUniversalisConfiguration.SaleHistoryLimit);
-                _ = _framework.RunOnFrameworkThread(() =>
-                    ItemPriceRetrieved?.Invoke(apiListing.itemID, worldId, listing));
+                pricings = new List<PricingAPIResponse> { apiListing };
             }
             else
             {
@@ -556,13 +661,20 @@ public class HostedUniversalis : BackgroundService, IUniversalis
                     return;
                 }
 
-                foreach (var item in multiRequest.items.Select(c => c.Value))
-                {
-                    var listing = MarketPricing.FromApi(item, worldId,
-                        _hostedUniversalisConfiguration.SaleHistoryLimit);
-                    _ = _framework.RunOnFrameworkThread(() =>
-                        ItemPriceRetrieved?.Invoke(item.itemID, worldId, listing));
-                }
+                pricings = multiRequest.items.Select(c => c.Value).ToList();
+            }
+
+            // 成交歷史是第二個請求。拿不到不影響價格,所以刻意放在算 MarketPricing
+            // 之前、而且自己吞掉所有失敗。
+            await MergeRecentHistoryAsync(pricings, itemIdsString, itemIdList.Count, worldId, worldName,
+                token);
+
+            foreach (var item in pricings)
+            {
+                var listing = MarketPricing.FromApi(item, worldId,
+                    _hostedUniversalisConfiguration.SaleHistoryLimit);
+                _ = _framework.RunOnFrameworkThread(() =>
+                    ItemPriceRetrieved?.Invoke(item.itemID, worldId, listing));
             }
 
             ReportSuccess(worldId, worldName, itemIdList.Count);

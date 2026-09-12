@@ -70,8 +70,15 @@ public class MarketPricing  : ICsv
     public static MarketPricing FromApi(PricingAPIResponse apiResponse, uint worldId, int saleHistoryLimit)
     {
         MarketPricing response = new MarketPricing();
-        response.AveragePriceNq = apiResponse.averagePriceNQ;
-        response.AveragePriceHq = apiResponse.averagePriceHQ;
+        // 🔴 averagePrice* 是成交歷史算的,查不到歷史時對方回 0。
+        //    把「不知道」寫成 0 會在畫面上被讀成「均價 0 gil」,所以退回
+        //    currentAveragePrice*(掛售算的,不依賴成交歷史)。
+        response.AveragePriceNq = apiResponse.averagePriceNQ > 0
+            ? apiResponse.averagePriceNQ
+            : apiResponse.currentAveragePriceNQ;
+        response.AveragePriceHq = apiResponse.averagePriceHQ > 0
+            ? apiResponse.averagePriceHQ
+            : apiResponse.currentAveragePriceHQ;
         response.MinPriceHq = apiResponse.minPriceHQ;
         response.MinPriceNq = apiResponse.minPriceNQ;
         response.ItemId = apiResponse.itemID;
