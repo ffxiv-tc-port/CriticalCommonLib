@@ -31,7 +31,22 @@ namespace CriticalCommonLib.MarketBoard
         private Dictionary<uint, string> _worldNames = new();
         private bool _tooManyRequests;
         private bool _initialised;
-        private DateTime? _nextRequestTime;
+        /// <summary>
+        /// <c>NextRequestTime</c> 的存放處,存 Ticks + 1(0 = 沒有排定時間)。
+        /// 🔴 SerialQueue 的工作執行緒寫、框架執行緒讀,都不拿鎖。
+        /// </summary>
+        private long _nextRequestTimeTicks;
+
+        private DateTime? NextRequestTime
+        {
+            get
+            {
+                var ticks = Volatile.Read(ref _nextRequestTimeTicks);
+                return ticks == 0 ? null : new DateTime(ticks - 1, DateTimeKind.Local);
+            }
+            set => Volatile.Write(ref _nextRequestTimeTicks,
+                value is null ? 0L : value.Value.Ticks + 1);
+        }
 
         private readonly int MaxBufferCount = 50;
         private readonly int BufferInterval = 1;
@@ -80,10 +95,12 @@ namespace CriticalCommonLib.MarketBoard
                     var itemIds = x.ToList();
                     var queuedCount = itemIds.Count();
                     _queuedCount -= queuedCount;
-                    if (_tooManyRequests && _nextRequestTime != null && _nextRequestTime.Value <= DateTime.Now)
+                    // 只讀一次:分兩次讀的話判斷與取值會落在不同的值上。
+                    var nextRequestTime = NextRequestTime;
+                    if (_tooManyRequests && nextRequestTime != null && nextRequestTime.Value <= DateTime.Now)
                     {
                         _tooManyRequests = false;
-                        _nextRequestTime = null;
+                        NextRequestTime = null;
                     }
                     itemIds = itemIds.Distinct().ToList();
                     if (itemIds.Any())
@@ -110,7 +127,23 @@ namespace CriticalCommonLib.MarketBoard
             }
         }
 
-        public DateTime? LastFailure { get; private set; }
+        /// <summary>存放處,存 Ticks + 1(0 = 還沒失敗過)。理由同 HostedUniversalis。</summary>
+        private long _lastFailureTicks;
+
+        /// <summary>
+        /// 最近一次查價失敗的時間。工作執行緒寫、繪製執行緒讀,兩邊都不拿鎖。
+        /// </summary>
+        public DateTime? LastFailure
+        {
+            get
+            {
+                var ticks = Volatile.Read(ref _lastFailureTicks);
+                return ticks == 0 ? null : new DateTime(ticks - 1, DateTimeKind.Local);
+            }
+            private set => Volatile.Write(ref _lastFailureTicks,
+                value is null ? 0L : value.Value.Ticks + 1);
+        }
+
         public bool TooManyRequests => _tooManyRequests;
 
         public int QueuedCount
@@ -231,7 +264,7 @@ namespace CriticalCommonLib.MarketBoard
                             if (webresponse.StatusCode == HttpStatusCode.TooManyRequests)
                             {
                                 _pluginLog.Warning("Universalis: too many requests!");
-                                _nextRequestTime = DateTime.Now.AddMinutes(1);
+                                NextRequestTime = DateTime.Now.AddMinutes(1);
                                 _tooManyRequests = true;
                             }
 

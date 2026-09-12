@@ -110,10 +110,41 @@ public class HostedUniversalis : BackgroundService, IUniversalis
     /// </summary>
     public uint MaxRetries { get; } = 5;
 
-    public DateTime? LastFailure { get; private set; }
-    public bool TooManyRequests { get; private set; }
+    /// <summary>
+    /// <see cref="LastFailure"/> 的存放處,存 Ticks + 1 ——
+    /// DateTime.MinValue.Ticks 就是 0,會和「還沒失敗過」的哨兵值撞在一起。
+    /// </summary>
+    private long _lastFailureTicks;
 
-    public int QueuedCount => _queuedCount;
+    /// <summary>
+    /// 最近一次查價失敗的時間;null = 沒失敗過,或已經成功而被清掉。
+    /// 🔴 背景查價工作寫、ImGui 繪製執行緒讀,兩邊都不拿鎖 ⇒ DateTime? 的
+    ///    16 bytes 指派不是原子的,會讀到半套。
+    /// </summary>
+    public DateTime? LastFailure
+    {
+        get
+        {
+            var ticks = Volatile.Read(ref _lastFailureTicks);
+            return ticks == 0 ? null : new DateTime(ticks - 1, DateTimeKind.Local);
+        }
+        private set => Volatile.Write(ref _lastFailureTicks,
+            value is null ? 0L : value.Value.Ticks + 1);
+    }
+
+    private int _tooManyRequestsFlag;
+
+    /// <summary>
+    /// 讀寫兩端同 <see cref="LastFailure"/>。bool 不會撕裂,但沒有屏障會一直讀到舊值。
+    /// </summary>
+    public bool TooManyRequests
+    {
+        get => Volatile.Read(ref _tooManyRequestsFlag) != 0;
+        private set => Volatile.Write(ref _tooManyRequestsFlag, value ? 1 : 0);
+    }
+
+    /// <summary>寫入端走 Interlocked,這裡只需要一道讀取屏障。</summary>
+    public int QueuedCount => Volatile.Read(ref _queuedCount);
 
 
     public HostedUniversalis(ILogger<HostedUniversalis> logger, UniversalisUserAgent userAgent, HttpClient httpClient, BackgroundTaskQueue.Factory taskQueueFactory, ExcelSheet<World> worldSheet, IFramework framework, IHostedUniversalisConfiguration hostedUniversalisConfiguration, UniversalisAvailability universalisAvailability)
