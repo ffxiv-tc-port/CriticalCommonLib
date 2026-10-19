@@ -23,7 +23,7 @@ namespace CriticalCommonLib.Models
 {
     using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 
-    public class InventoryItem : IEquatable<InventoryItem>, ICsv, IItem
+    public class InventoryItem : IEquatable<InventoryItem>, ICsv, IItem, Helpers.ICsvFields
     {
         private readonly ItemSheet _itemSheet;
         private readonly ExcelSheet<Stain> _stainSheet;
@@ -66,6 +66,40 @@ namespace CriticalCommonLib.Models
         {
             _itemSheet = itemSheet;
             _stainSheet = stainSheet;
+        }
+
+        /// <summary>每個欄位回到剛建構好的值（兩張表除外），讓暫存物件可以重用；新增欄位時這裡要一起補。</summary>
+        internal void ResetForReuse()
+        {
+            Container = default;
+            Slot = 0;
+            ItemId = 0;
+            Quantity = 0;
+            Spiritbond = 0;
+            Condition = 0;
+            Flags = default;
+            Materia0 = 0;
+            Materia1 = 0;
+            Materia2 = 0;
+            Materia3 = 0;
+            Materia4 = 0;
+            MateriaLevel0 = 0;
+            MateriaLevel1 = 0;
+            MateriaLevel2 = 0;
+            MateriaLevel3 = 0;
+            MateriaLevel4 = 0;
+            Stain = 0;
+            Stain2 = 0;
+            GlamourId = 0;
+            SortedContainer = default;
+            SortedCategory = default;
+            SortedSlotIndex = 0;
+            GlamourIndex = 0;
+            RetainerId = 0;
+            TempQuantity = 0;
+            RetainerMarketPrice = 0;
+            GearSets = Array.Empty<uint>();
+            GearSetNames = Array.Empty<string>();
         }
 
         public void FromSerializedItem(ulong[] serializedItem)
@@ -514,7 +548,7 @@ namespace CriticalCommonLib.Models
                 return false;
             }
 
-            if (GearSets != null && otherItem.GearSets != null && (GearSets.Length != 0 || otherItem.GearSets.Length != 0) && !GearSets.OrderBy(x => x).SequenceEqual(otherItem.GearSets.OrderBy(x => x)))
+            if (GearSets != null && otherItem.GearSets != null && (GearSets.Length != 0 || otherItem.GearSets.Length != 0) && !SameGearSets(GearSets, otherItem.GearSets))
             {
                 return false;
             }
@@ -625,12 +659,49 @@ namespace CriticalCommonLib.Models
                 return InventoryChangeReason.MarketPriceChanged;
             }
 
-            if (GearSets != null && otherItem.GearSets != null && (GearSets.Length != 0 || otherItem.GearSets.Length != 0) && GearSets.Length == otherItem.GearSets.Length && !GearSets.OrderBy(x => x).SequenceEqual(otherItem.GearSets.OrderBy(x => x)))
+            if (GearSets != null && otherItem.GearSets != null && (GearSets.Length != 0 || otherItem.GearSets.Length != 0) && GearSets.Length == otherItem.GearSets.Length && !SameGearSets(GearSets, otherItem.GearSets))
             {
                 return InventoryChangeReason.GearsetsChanged;
             }
 
             return null;
+        }
+
+        private const int SameGearSetsStackLimit = 128;
+
+        /// <summary>
+        /// 與 <c>a.OrderBy(x => x).SequenceEqual(b.OrderBy(x => x))</c> 同值（多重集合相等：不計順序、重複要計、長度不同即不等），
+        /// 但不配置記憶體；超過 <see cref="SameGearSetsStackLimit"/> 格才退回原寫法。
+        /// </summary>
+        private static bool SameGearSets(uint[] a, uint[] b)
+        {
+            if (ReferenceEquals(a, b))
+            {
+                return true;
+            }
+
+            if (a.Length != b.Length)
+            {
+                return false;
+            }
+
+            if (a.AsSpan().SequenceEqual(b))
+            {
+                return true;
+            }
+
+            if (a.Length > SameGearSetsStackLimit)
+            {
+                return a.OrderBy(x => x).SequenceEqual(b.OrderBy(x => x));
+            }
+
+            Span<uint> sortedA = stackalloc uint[a.Length];
+            Span<uint> sortedB = stackalloc uint[b.Length];
+            a.CopyTo(sortedA);
+            b.CopyTo(sortedB);
+            sortedA.Sort();
+            sortedB.Sort();
+            return sortedA.SequenceEqual(sortedB);
         }
 
         /// <summary>
@@ -771,52 +842,93 @@ namespace CriticalCommonLib.Models
             }
         }
 
+        /// <summary><see cref="ToCsv"/> 的欄位數。</summary>
+        internal const int CsvFieldCount = 27;
+
         public string[] ToCsv()
         {
-            List<string> csvData = new List<string>();
-            csvData.Add(((int)this.Container).ToString());
-            csvData.Add(Slot.ToString());
-            csvData.Add(ItemId.ToString());
-            csvData.Add(Quantity.ToString());
-            csvData.Add(Spiritbond.ToString());
-            csvData.Add(Condition.ToString());
-            csvData.Add(((int)Flags).ToString());
-            csvData.Add(Materia0.ToString());
-            csvData.Add(Materia1.ToString());
-            csvData.Add(Materia2.ToString());
-            csvData.Add(Materia3.ToString());
-            csvData.Add(Materia4.ToString());
-            csvData.Add(MateriaLevel0.ToString());
-            csvData.Add(MateriaLevel1.ToString());
-            csvData.Add(MateriaLevel2.ToString());
-            csvData.Add(MateriaLevel3.ToString());
-            csvData.Add(MateriaLevel4.ToString());
-            csvData.Add(Stain.ToString());
-            csvData.Add(Stain2.ToString());
-            csvData.Add(GlamourId.ToString());
-            csvData.Add(((int)SortedContainer).ToString());
-            csvData.Add(((int)SortedCategory).ToString());
-            csvData.Add(SortedSlotIndex.ToString());
-            csvData.Add(RetainerId.ToString());
-            csvData.Add(RetainerMarketPrice.ToString());
-            if (GearSets == null)
+            var csvData = new string[CsvFieldCount];
+            WriteCsvFields(csvData, 0);
+            return csvData;
+        }
+
+        /// <summary>把 <see cref="ToCsv"/> 的欄位依序填進 <paramref name="csvData"/> 從 <paramref name="o"/> 起的 <see cref="CsvFieldCount"/> 格。</summary>
+        internal void WriteCsvFields(string[] csvData, int o)
+        {
+            csvData[o + 0] = ((int)this.Container).ToString();
+            csvData[o + 1] = Slot.ToString();
+            csvData[o + 2] = ItemId.ToString();
+            csvData[o + 3] = Quantity.ToString();
+            csvData[o + 4] = Spiritbond.ToString();
+            csvData[o + 5] = Condition.ToString();
+            csvData[o + 6] = ((int)Flags).ToString();
+            csvData[o + 7] = Materia0.ToString();
+            csvData[o + 8] = Materia1.ToString();
+            csvData[o + 9] = Materia2.ToString();
+            csvData[o + 10] = Materia3.ToString();
+            csvData[o + 11] = Materia4.ToString();
+            csvData[o + 12] = MateriaLevel0.ToString();
+            csvData[o + 13] = MateriaLevel1.ToString();
+            csvData[o + 14] = MateriaLevel2.ToString();
+            csvData[o + 15] = MateriaLevel3.ToString();
+            csvData[o + 16] = MateriaLevel4.ToString();
+            csvData[o + 17] = Stain.ToString();
+            csvData[o + 18] = Stain2.ToString();
+            csvData[o + 19] = GlamourId.ToString();
+            csvData[o + 20] = ((int)SortedContainer).ToString();
+            csvData[o + 21] = ((int)SortedCategory).ToString();
+            csvData[o + 22] = SortedSlotIndex.ToString();
+            csvData[o + 23] = RetainerId.ToString();
+            csvData[o + 24] = RetainerMarketPrice.ToString();
+            csvData[o + 25] = GearSets == null || GearSets.Length == 0 ? "" : String.Join(";", GearSets.Select(c => c.ToString()));
+            csvData[o + 26] = GearSetNames == null || GearSetNames.Length == 0 ? "" : String.Join(";", GearSetNames.Select(c => c.ToString()));
+        }
+
+        // 與 WriteCsvFields 逐欄對應（同樣的 ToString、同樣的空值寫法）；改一邊就要改另一邊。
+        void Helpers.ICsvFields.WriteCsvRow(Helpers.CsvRowWriter.FieldWriter row)
+        {
+            row.Formatted((int)this.Container);
+            row.Formatted(Slot);
+            row.Formatted(ItemId);
+            row.Formatted(Quantity);
+            row.Formatted(Spiritbond);
+            row.Formatted(Condition);
+            row.Formatted((int)Flags);
+            row.Formatted(Materia0);
+            row.Formatted(Materia1);
+            row.Formatted(Materia2);
+            row.Formatted(Materia3);
+            row.Formatted(Materia4);
+            row.Formatted(MateriaLevel0);
+            row.Formatted(MateriaLevel1);
+            row.Formatted(MateriaLevel2);
+            row.Formatted(MateriaLevel3);
+            row.Formatted(MateriaLevel4);
+            row.Formatted(Stain);
+            row.Formatted(Stain2);
+            row.Formatted(GlamourId);
+            row.Formatted((int)SortedContainer);
+            row.Formatted((int)SortedCategory);
+            row.Formatted(SortedSlotIndex);
+            row.Formatted(RetainerId);
+            row.Formatted(RetainerMarketPrice);
+            if (GearSets == null || GearSets.Length == 0)
             {
-                csvData.Add("");
+                row.Text("");
             }
             else
             {
-                csvData.Add(String.Join(";", GearSets.Select(c => c.ToString())));
-            }
-            if (GearSetNames == null)
-            {
-                csvData.Add("");
-            }
-            else
-            {
-                csvData.Add(String.Join(";", GearSetNames.Select(c => c.ToString())));
+                row.Joined(GearSets);
             }
 
-            return csvData.ToArray();
+            if (GearSetNames == null || GearSetNames.Length == 0)
+            {
+                row.Text("");
+            }
+            else
+            {
+                row.Joined(GearSetNames);
+            }
         }
 
         public bool IncludeInCsv()

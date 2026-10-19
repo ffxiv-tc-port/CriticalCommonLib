@@ -1,15 +1,17 @@
 using System;
-using System.Linq;
 using CriticalCommonLib.Crafting;
-using FFXIVClientStructs.FFXIV.Client.UI;
+using FFXIVClientStructs.FFXIV.Component.GUI;
 
 namespace CriticalCommonLib.Agents
 {
     //Not really an agent but seems a good as spot as any
+    /// <summary>
+    /// Reads the Synthesis window's AtkValues. Holds no native pointer between frames: every read resolves the window
+    /// again and only reads a slot that is inside AtkValuesCount (window gone or array too short reads 0, like a null agent did).
+    /// </summary>
     public unsafe class CraftingAgent
     {
-        private const int OffsetCraftingAgent = 376;
-
+        // Byte offsets into the AtkValues array: slot * 16 + 8, the value half of AtkValue[slot].
         private const int OffsetStep       = 248;
         private const int OffsetStatus     = 200;
         private const int OffsetDurability = 120;
@@ -19,53 +21,72 @@ namespace CriticalCommonLib.Agents
         private const int OffsetResultItemId   = 264;
         private const int OffsetIsTrialSynthesis   = 24;
 
-        public  AddonSynthesis* Pointer;
-        private byte*           _agent;
+        private readonly Func<nint> _addonResolver;
 
+        /// <param name="addonResolver">Returns the Synthesis window's current address, 0 when it is not loaded.</param>
+        public CraftingAgent(Func<nint> addonResolver)
+        {
+            _addonResolver = addonResolver;
+        }
+
+        /// <summary>The window's current AtkValues array, for display only; null when the window is not loaded.</summary>
         public byte* Agent
         {
             get
             {
-                return _agent;
+                var addon = (AtkUnitBase*)_addonResolver();
+                return addon == null ? null : (byte*)addon->AtkValues;
             }
         }
 
-
-        public static implicit operator CraftingAgent(IntPtr ptr)
+        /// <summary>All values from one lookup of the window; read once per frame instead of property by property.</summary>
+        public Values Read()
         {
-            var ret = new CraftingAgent { Pointer = (AddonSynthesis*)ptr };
-            if (ret)
-                ret._agent = *(byte**)((byte*)ret.Pointer + OffsetCraftingAgent);
+            var addon = (AtkUnitBase*)_addonResolver();
+            if (addon == null || addon->AtkValues == null)
+            {
+                return default;
+            }
 
-            return ret;
+            var values = (byte*)addon->AtkValues;
+            int count = addon->AtkValuesCount;
+            var trial = Slot(values, count, OffsetIsTrialSynthesis);
+            return new Values(
+                ReadInt(values, count, OffsetStep),
+                (CraftStatus)ReadInt(values, count, OffsetStatus),
+                trial != null && *(bool*)trial,
+                ReadInt(values, count, OffsetDurability),
+                ReadInt(values, count, OffsetHqChance),
+                ReadInt(values, count, OffsetQuality),
+                ReadInt(values, count, OffsetProgress),
+                (uint)ReadInt(values, count, OffsetResultItemId));
         }
 
-        public static implicit operator bool(CraftingAgent ptr)
-            => ptr.Pointer != null;
+        internal static byte* Slot(byte* values, int count, int byteOffset)
+            => byteOffset / 16 < count ? values + byteOffset : null;
 
+        internal static int ReadInt(byte* values, int count, int byteOffset)
+        {
+            var slot = Slot(values, count, byteOffset);
+            return slot == null ? 0 : *(int*)slot;
+        }
 
-        public int Step
-            => _agent == null ? 0 : *(int*)(_agent + OffsetStep);
+        public readonly record struct Values(int Step, CraftStatus Status, bool IsTrialSynthesis, int Durability, int HqChance, int Quality, int Progress, uint ResultItemId);
 
-        public CraftStatus Status
-            => _agent == null ? 0 : *(CraftStatus*)(_agent + OffsetStatus);
+        public int Step => Read().Step;
 
-        public bool IsTrialSynthesis
-            => _agent != null && *(bool*)(_agent + OffsetIsTrialSynthesis);
+        public CraftStatus Status => Read().Status;
 
-        public int Durability
-            => _agent == null ? 0 : *(int*)(_agent + OffsetDurability);
+        public bool IsTrialSynthesis => Read().IsTrialSynthesis;
 
-        public int HqChance
-            => _agent == null ? 0 : *(int*)(_agent + OffsetHqChance);
+        public int Durability => Read().Durability;
 
-        public int Quality
-            => _agent == null ? 0 : *(int*)(_agent + OffsetQuality);
+        public int HqChance => Read().HqChance;
 
-        public int Progress
-            => _agent == null ? 0 : *(int*)(_agent + OffsetProgress);
+        public int Quality => Read().Quality;
 
-        public uint ResultItemId
-            => _agent == null ? 0 : *(uint*)(_agent + OffsetResultItemId);
+        public int Progress => Read().Progress;
+
+        public uint ResultItemId => Read().ResultItemId;
     }
 }

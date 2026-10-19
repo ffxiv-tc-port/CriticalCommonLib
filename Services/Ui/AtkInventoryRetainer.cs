@@ -1,6 +1,5 @@
 using System.Collections.Generic;
 using System.Numerics;
-using CriticalCommonLib.Addons;
 using CriticalCommonLib.Enums;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Component.GUI;
@@ -34,11 +33,11 @@ namespace CriticalCommonLib.Services.Ui
         {
             get
             {
-                var addon = AtkUnitBase;
-                if (addon != null && addon.AtkUnitBase != null)
+                var addon = AddonPointer;
+                if (addon != null)
                 {
-                    var largeAddon = (InventoryRetainerAddon*) addon.AtkUnitBase;
-                    return largeAddon->CurrentTab;
+                    var largeAddon = (FFXIVClientStructs.FFXIV.Client.UI.AddonInventoryRetainer*) addon;
+                    return largeAddon->TabIndex;
                 }
                 return -1;
             }

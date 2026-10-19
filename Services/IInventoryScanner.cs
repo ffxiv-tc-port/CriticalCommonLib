@@ -67,6 +67,9 @@ namespace CriticalCommonLib.Services
         string[] GearSetNames { get; }
         HashSet<(byte, string)> GetGearSets(uint itemId);
         Dictionary<uint, HashSet<(byte, string)>> GetGearSets();
+
+        /// <summary>與 <see cref="GetGearSets()"/> 同內容的唯讀快照，可在任何執行緒呼叫；預設實作每次現算。</summary>
+        GearSetMembership GetGearSetMembership() => GearSetMembership.FromSets(GetGearSets());
         unsafe void ParseCharacterBags(InventorySortOrder currentSortOrder, BagChangeContainer changeSet);
         unsafe void ParseSaddleBags(InventorySortOrder currentSortOrder, BagChangeContainer changeSet);
         unsafe void ParsePremiumSaddleBags(InventorySortOrder currentSortOrder, BagChangeContainer changeSet);

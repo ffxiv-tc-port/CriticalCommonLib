@@ -72,9 +72,19 @@ namespace CriticalCommonLib.Services
             _framework.RunOnFrameworkThread(() =>
             {
                 var itemIdShort = (ushort)(itemId % 500_000);
+                // 不可以寫成 Framework.Instance()->UIModule->GetAgentModule()->GetAgentByInternalId(...)：
+                // Framework.Instance() 是 [StaticAddress(isPointer: true)] 可能回 null，
+                // UIModule 是它的欄位也可能是 null，GetAgentModule() 是 [VirtualFunction(37)]
+                // ——this 為 null 會從位址 0 讀 vtable，是 try/catch 攔不到的 AccessViolationException。
+                // AgentModule.Instance() 是 FFXIVClientStructs 寫好的判空版本，只需再擋它回 null。
+                var agentModule = AgentModule.Instance();
+                if (agentModule == null)
+                {
+                    return;
+                }
+
                 AgentGatheringNote* agent =
-                    (AgentGatheringNote*)Framework.Instance()->UIModule->GetAgentModule()->GetAgentByInternalId(
-                        AgentId.GatheringNote);
+                    (AgentGatheringNote*)agentModule->GetAgentByInternalId(AgentId.GatheringNote);
                 if (agent != null)
                 {
                     agent->OpenGatherableByItemId(itemIdShort);
@@ -87,9 +97,16 @@ namespace CriticalCommonLib.Services
             _framework.RunOnFrameworkThread(() =>
             {
                 var itemIdShort = (ushort)(itemId % 500_000);
+                // 同 OpenGatheringLog：用判空版 AgentModule.Instance()，
+                // 取不到就安靜跳過這次開窗（使用者再點一次即可，沒有狀態被弄髒）。
+                var agentModule = AgentModule.Instance();
+                if (agentModule == null)
+                {
+                    return;
+                }
+
                 var agent =
-                    (AgentFishGuide*)Framework.Instance()->UIModule->GetAgentModule()->GetAgentByInternalId(
-                        AgentId.FishGuide);
+                    (AgentFishGuide*)agentModule->GetAgentByInternalId(AgentId.FishGuide);
                 if (agent != null)
                 {
                     agent->OpenForItemId(itemIdShort, isSpearfishing);
@@ -133,7 +150,21 @@ namespace CriticalCommonLib.Services
             itemId = itemId % 500_000;
             if (_recipeSheet.HasRecipesByItemId(itemId) && _itemSheet.BaseSheet.HasRow(itemId))
             {
-                _framework.RunOnFrameworkThread(() => { AgentRecipeNote.Instance()->SearchRecipeByItemId(itemId); });
+                // AgentRecipeNote.Instance() 是 [Agent(AgentId.RecipeNote)] 產生的兩層包裝
+                // （AgentModule.Instance() 為 null 回 null，否則回 GetAgentByInternalId(...)），
+                // 兩層都合法可為 null。SearchRecipeByItemId() 是 [MemberFunction]，null 的 this 會直接進原生碼解參考，
+                // 那是 try/catch 攔不到的 AccessViolationException。
+                // 取不到就安靜跳過這次開窗（使用者再點一次即可）。
+                _framework.RunOnFrameworkThread(() =>
+                {
+                    var agentRecipeNote = AgentRecipeNote.Instance();
+                    if (agentRecipeNote == null)
+                    {
+                        return;
+                    }
+
+                    agentRecipeNote->SearchRecipeByItemId(itemId);
+                });
             }
 
             return true;
@@ -157,7 +188,18 @@ namespace CriticalCommonLib.Services
             itemId %= 500_000;
             if (_recipeSheet.HasRecipesByItemId(itemId) && _recipeSheet.BaseSheet.HasRow(recipeId))
             {
-                _framework.RunOnFrameworkThread(() => { AgentRecipeNote.Instance()->OpenRecipeByRecipeId(recipeId); });
+                // 同上一個多載：AgentRecipeNote.Instance() 兩層都合法可為 null，
+                // 取不到就安靜跳過這次開窗。
+                _framework.RunOnFrameworkThread(() =>
+                {
+                    var agentRecipeNote = AgentRecipeNote.Instance();
+                    if (agentRecipeNote == null)
+                    {
+                        return;
+                    }
+
+                    agentRecipeNote->OpenRecipeByRecipeId(recipeId);
+                });
             }
             return true;
         }
@@ -175,20 +217,6 @@ namespace CriticalCommonLib.Services
             {
             }
             _disposed = true;
-        }
-
-        ~GameInterface()
-        {
-#if DEBUG
-            // In debug-builds, make sure that a warning is displayed when the Disposable object hasn't been
-            // disposed by the programmer.
-
-            if( _disposed == false )
-            {
-                _pluginLog.Error("There is a disposable object which hasn't been disposed before the finalizer call: " + (this.GetType ().Name));
-            }
-#endif
-            Dispose (true);
         }
     }
 }

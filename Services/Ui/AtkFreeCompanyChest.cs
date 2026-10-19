@@ -20,10 +20,10 @@ namespace CriticalCommonLib.Services.Ui
         {
             get
             {
-                var addon = AtkUnitBase;
-                if (addon != null && addon.AtkUnitBase != null)
+                var addon = AddonPointer;
+                if (addon != null)
                 {
-                    var largeAddon = (InventoryFreeCompanyChestAddon*) addon.AtkUnitBase;
+                    var largeAddon = (InventoryFreeCompanyChestAddon*) addon;
                     return largeAddon->CurrentTab;
                 }
                 return FreeCompanyTab.Unknown;

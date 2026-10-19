@@ -21,7 +21,7 @@ namespace CriticalCommonLib.Services.Ui
         {
             get
             {
-                var intPtr = _gameGui.GetAddonByName(WindowName.ToString(), 1);
+                var intPtr = _gameGui.GetAddonByName(WindowNameStr, 1);
                 if (intPtr == IntPtr.Zero)
                 {
                     return null;
@@ -29,6 +29,10 @@ namespace CriticalCommonLib.Services.Ui
                 return new AtkBaseWrapper((AtkUnitBase*) intPtr.Address);
             }
         }
+
+        /// <summary>同 <see cref="AtkUnitBase"/> 但不配置包裝物件；取不到為 null。只在當下這一幀用，不可存起來。</summary>
+        /// <remarks>每幀都跑的 <c>Update</c>（讀目前分頁）走這一支，視窗載入著的期間每幀省一個包裝物件。</remarks>
+        protected unsafe AtkUnitBase* AddonPointer => (AtkUnitBase*)_gameGui.GetAddonByName(WindowNameStr, 1).Address;
 
         public void SendUpdatedEvent()
         {
@@ -41,7 +45,7 @@ namespace CriticalCommonLib.Services.Ui
         {
             get
             {
-                var intPtr = _gameGui.GetAddonByName(WindowName.ToString(), 1);
+                var intPtr = _gameGui.GetAddonByName(WindowNameStr, 1);
                 if (intPtr == IntPtr.Zero)
                 {
                     return false;

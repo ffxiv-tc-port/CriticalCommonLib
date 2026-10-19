@@ -6,6 +6,14 @@ namespace CriticalCommonLib.MarketBoard
 {
     public interface IMarketCache : IDisposable
     {
+        /// <summary>
+        /// 目前是否還有任何世界查得到線上市場資料(universalis)。逐個世界執行期判定,
+        /// 不按客戶端語言一刀切——universalis 收得到台服(繁中服)8 個世界的資料。
+        /// 為 false 時代表問過的世界全部不在 universalis 的世界清單裡,顯示端應該把價格畫成「沒有資料」,
+        /// 而不是畫成 0(會誤導)或永遠不會結束的「loading...」。
+        /// </summary>
+        bool MarketDataAvailable { get; }
+
         void LoadExistingCache();
         void ClearCache();
         void SaveCache(bool forceSave = false);

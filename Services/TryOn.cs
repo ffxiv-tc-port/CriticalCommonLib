@@ -73,26 +73,12 @@ namespace CriticalCommonLib.Services {
         {
             if(!_disposed && disposing)
             {
-                if (CanUseTryOn)
+                if (CanUseTryOn && _framework != null)
                 {
                     _framework.Update -= FrameworkUpdate;
                 }
             }
             _disposed = true;
-        }
-
-        ~TryOn()
-        {
-#if DEBUG
-            // In debug-builds, make sure that a warning is displayed when the Disposable object hasn't been
-            // disposed by the programmer.
-
-            if( _disposed == false )
-            {
-                _pluginLog.Error("There is a disposable object which hasn't been disposed before the finalizer call: " + (this.GetType ().Name));
-            }
-#endif
-            Dispose (true);
         }
     }
 }

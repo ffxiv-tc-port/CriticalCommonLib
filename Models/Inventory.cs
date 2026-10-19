@@ -5,6 +5,8 @@ using AllaganLib.GameSheets.Sheets.Helpers;
 using CriticalCommonLib.Enums;
 using CriticalCommonLib.Extensions;
 using Dalamud.Plugin.Services;
+using Lumina.Excel;
+using Lumina.Excel.Sheets;
 
 namespace CriticalCommonLib.Models;
 
@@ -13,7 +15,8 @@ public class Inventory
     private ulong _characterId;
     private readonly CabinetSheet _cabinetSheet;
     private readonly IPluginLog _pluginLog;
-    private readonly InventoryItem.Factory _inventoryItemFactory;
+    private readonly ItemSheet _itemSheet;
+    private readonly ExcelSheet<Stain> _stainSheet;
     private readonly InventoryChange.FromGameItemFactory _fromGameItemFactory;
     private CharacterType _ownerType;
 
@@ -91,11 +94,12 @@ public class Inventory
 
     public delegate Inventory Factory(CharacterType ownerType, ulong characterId);
 
-    public Inventory(CabinetSheet cabinetSheet, IPluginLog pluginLog, InventoryItem.Factory inventoryItemFactory, InventoryChange.FromGameItemFactory fromGameItemFactory, CharacterType ownerType, ulong characterId)
+    public Inventory(CabinetSheet cabinetSheet, IPluginLog pluginLog, ItemSheet itemSheet, ExcelSheet<Stain> stainSheet, InventoryChange.FromGameItemFactory fromGameItemFactory, CharacterType ownerType, ulong characterId)
     {
         _cabinetSheet = cabinetSheet;
         _pluginLog = pluginLog;
-        _inventoryItemFactory = inventoryItemFactory;
+        _itemSheet = itemSheet;
+        _stainSheet = stainSheet;
         _fromGameItemFactory = fromGameItemFactory;
         _ownerType = ownerType;
         _characterId = characterId;
@@ -126,9 +130,20 @@ public class Inventory
             inventoryChanges = new List<InventoryChange>();
         }
 
+        // 沒變的格子不建新物件：同一個暫存物件逐格重填再比，有變才把它放進格子並另建下一個；
+        // 放進格子（交出去）的物件之後不再被這裡改。
+        InventoryItem? newItem = null;
         for (var index = 0; index < items.Length; index++)
         {
-            var newItem = _inventoryItemFactory.Invoke();
+            if (newItem == null)
+            {
+                newItem = new InventoryItem(_itemSheet, _stainSheet);
+            }
+            else
+            {
+                newItem.ResetForReuse();
+            }
+
             newItem.FromGameItem(items[index]);
             newItem.SortedContainer = sortedType;
             newItem.SortedCategory = sortedCategory;
@@ -139,6 +154,7 @@ public class Inventory
             {
                 inventory[newItem.SortedSlotIndex] = newItem;
                 inventoryChanges.Add(_fromGameItemFactory.Invoke(null, newItem, sortedType, initialLoad));
+                newItem = null;
             }
             else
             {
@@ -147,6 +163,7 @@ public class Inventory
                 {
                     inventory[newItem.SortedSlotIndex] = newItem;
                     inventoryChanges.Add(_fromGameItemFactory.Invoke(existingItem, newItem, sortedType, initialLoad));
+                    newItem = null;
                 }
             }
         }
@@ -231,7 +248,21 @@ public class Inventory
     {
 
         List<InventoryChange> inventoryChanges = new List<InventoryChange>();
+        return PlaceItems(items, initialLoad, inventoryChanges) ? inventoryChanges : null;
+    }
 
+    /// <summary>
+    /// 放置規則、遇到不認得的袋子就停（含那則 Error）都與 <see cref="LoadItems(InventoryItem[], bool)"/> 相同，只是不建變動清單；
+    /// 回 false＝中途停了（對應 LoadItems 回 null）。
+    /// </summary>
+    public bool LoadItemsWithoutChanges(InventoryItem[] items)
+    {
+        return PlaceItems(items, true, null);
+    }
+
+    // changes 為 null 時不建 InventoryChange（每筆都要經 Autofac 的委派工廠）；IsSame 沒有副作用，跟著省掉。
+    private bool PlaceItems(InventoryItem[] items, bool initialLoad, List<InventoryChange>? inventoryChanges)
+    {
         for (var index = 0; index < items.Length; index++)
         {
             var newItem = items[index];
@@ -239,7 +270,7 @@ public class Inventory
             if (inventory == null)
             {
                 _pluginLog.Error("Failed to find somewhere to put the items in the bag " + newItem.SortedContainer + " for character " + CharacterId);
-                return null;
+                return false;
             }
 
             if (newItem.SortedSlotIndex >= 0 && newItem.SortedSlotIndex < inventory.Length)
@@ -247,9 +278,9 @@ public class Inventory
                 if (inventory[newItem.SortedSlotIndex] == null)
                 {
                     inventory[newItem.SortedSlotIndex] = newItem;
-                    inventoryChanges.Add(_fromGameItemFactory.Invoke(null, newItem, newItem.SortedContainer, initialLoad));
+                    inventoryChanges?.Add(_fromGameItemFactory.Invoke(null, newItem, newItem.SortedContainer, initialLoad));
                 }
-                else
+                else if (inventoryChanges != null)
                 {
                     var existingItem = inventory[newItem.SortedSlotIndex];
                     if (existingItem != null && !existingItem.IsSame(newItem))
@@ -261,7 +292,7 @@ public class Inventory
             }
         }
 
-        return inventoryChanges;
+        return true;
     }
 
     public InventoryItem?[]? GetInventoryByType(InventoryType type)
@@ -456,11 +487,13 @@ public class Inventory
         return mergedItems;
     }
 
+    /// <summary>Enum.GetValues 的結果只建一次（順序相同）；呼叫端只能讀，不可改內容。</summary>
+    internal static readonly InventoryType[] AllInventoryTypes = Enum.GetValues<InventoryType>();
+
     public List<InventoryItem?[]> GetAllInventories()
     {
         List<InventoryItem?[]> inventories = new List<InventoryItem?[]>();
-        var possibleValues = Enum.GetValues<InventoryType>();
-        foreach (var possibleValue in possibleValues)
+        foreach (var possibleValue in AllInventoryTypes)
         {
             var bag = GetInventoryByType(possibleValue);
             if (bag != null)
@@ -548,7 +581,7 @@ public class Inventory
                     var item = bag[index];
                     if (item == null)
                     {
-                        var inventoryItem = _inventoryItemFactory.Invoke();
+                        var inventoryItem = new InventoryItem(_itemSheet, _stainSheet);
                         inventoryItem.SortedSlotIndex = index;
                         inventoryItem.Container = possibleValue;
                         inventoryItem.SortedCategory = possibleValue.ToInventoryCategory();

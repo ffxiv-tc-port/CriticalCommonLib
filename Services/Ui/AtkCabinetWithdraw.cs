@@ -47,9 +47,10 @@ namespace CriticalCommonLib.Services.Ui
         {
             get
             {
-                if (AtkUnitBase != null)
+                var addon = AddonPointer;
+                if (addon != null)
                 {
-                    var cabinetWithdrawAddon = (AddonCabinetWithdraw*)this.AtkUnitBase.AtkUnitBase;
+                    var cabinetWithdrawAddon = (AddonCabinetWithdraw*)addon;
                     if (cabinetWithdrawAddon->ArtifactArmorRadioButton != null && cabinetWithdrawAddon->ArtifactArmorRadioButton->IsSelected)
                     {
                         return 0;
@@ -104,10 +105,8 @@ namespace CriticalCommonLib.Services.Ui
         {
             get
             {
-                if (AtkUnitBase != null)
+                if (AddonPointer != null)
                 {
-                    var cabinetWithdrawAddon = (AddonCabinetWithdraw*)this.AtkUnitBase.AtkUnitBase;
-
                     return CabinetCategories.GetValueOrDefault(SelectedTab);
                 }
                 return null;

@@ -101,8 +101,17 @@ namespace CriticalCommonLib.Services
             _framework.RunOnFrameworkThread(() =>
             {
                 _gameInteropProvider.InitializeFromAttributes(this);
+                if (_containerInfoNetworkHook != null)
+                {
+                    // Grab a delegate straight to the original function address while the hook
+                    // object is still around - see the field comment for why the detour needs it.
+                    _containerInfoOriginal ??=
+                        System.Runtime.InteropServices.Marshal
+                            .GetDelegateForFunctionPointer<ContainerInfoNetworkData>(
+                                _containerInfoNetworkHook.Address);
+                }
+
                 _containerInfoNetworkHook?.Enable();
-                _itemMarketBoardInfoHook?.Enable();
             });
             framework.Update += FrameworkOnUpdate;
             _gameUiManager.UiVisibilityChanged += GameUiManagerOnUiManagerVisibilityChanged;
@@ -413,32 +422,23 @@ namespace CriticalCommonLib.Services
 
         private unsafe delegate void* ContainerInfoNetworkData(int a2, int* a3);
 
-        private unsafe delegate void* ItemMarketBoardInfoData(int a2, int* a3);
-
         private unsafe delegate void* NpcSpawnData(int* a1, int a2, int* a3);
 
         //If the signature for these are ever lost, find the ProcessZonePacketDown signature in Dalamud and then find the relevant function based on the opcode.
         [Signature("48 89 74 24 ?? 57 48 81 EC ?? ?? ?? ?? 44 0F B7 42 ??", DetourName = nameof(ContainerInfoDetour), UseFlags = SignatureUseFlags.Hook)]
         private Hook<ContainerInfoNetworkData>? _containerInfoNetworkHook = null;
 
-        [Signature(
-            "E8 ?? ?? ?? ?? E9 ?? ?? ?? ?? 48 8B D7 41 8B CE E8 ?? ?? ?? ?? E9 ?? ?? ?? ?? 48 8D 57 10",
-            DetourName = nameof(ItemMarketBoardInfoDetour))]
-        private Hook<ItemMarketBoardInfoData>? _itemMarketBoardInfoHook = null;
+        /// <summary>
+        /// Delegate pointing straight at the original function address (no trampoline). Dispose() sets
+        /// <see cref="_containerInfoNetworkHook"/> back to null while the detour can still be executing, and
+        /// skipping the original is not an acceptable fallback: this is a zone packet handler returning void*.
+        /// Calling the raw address is safe precisely when the field is null - Hook.Dispose() runs Disable()
+        /// first, so the original bytes are already restored and there is no recursion back into the detour
+        /// (the same technique Dalamud itself uses in Hook&lt;T&gt;.OriginalDisposeSafe).
+        /// </summary>
+        private ContainerInfoNetworkData? _containerInfoOriginal = null;
 
         private readonly HashSet<InventoryType> _loadedInventories = new();
-        private readonly Dictionary<ulong,uint[]> _cachedRetainerMarketPrices = new Dictionary<ulong, uint[]>();
-
-
-        private uint[]? GetCachedMarketPrice(ulong retainerId)
-        {
-            if (_cachedRetainerMarketPrices.ContainsKey(retainerId))
-            {
-                return _cachedRetainerMarketPrices[retainerId];
-            }
-
-            return null;
-        }
 
         private unsafe void* ContainerInfoDetour(int seq, int* a3)
         {
@@ -474,42 +474,20 @@ namespace CriticalCommonLib.Services
                 });
             }
 
-            return _containerInfoNetworkHook!.Original(seq, a3);
-        }
-
-        private unsafe void* ItemMarketBoardInfoDetour(int seq, int* a3)
-        {
-            try
+            // Snapshot once - never read the field twice, and never dereference it bare.
+            var hook = _containerInfoNetworkHook;
+            var original = hook != null ? hook.OriginalDisposeSafe : _containerInfoOriginal;
+            if (original == null)
             {
-                if (a3 != null)
-                {
-                    var ptr = (IntPtr)a3 + 16;
-                    var containerInfo = NetworkDecoder.DecodeItemMarketBoardInfo(ptr);
-                    var currentRetainer = _characterMonitor.ActiveRetainerId;
-                    if (currentRetainer != 0)
-                    {
-                        if (!_cachedRetainerMarketPrices.ContainsKey(currentRetainer))
-                        {
-                            _cachedRetainerMarketPrices[currentRetainer] = new uint[20];
-                        }
-
-                        if (Enum.IsDefined(typeof(InventoryType), containerInfo.containerId) &&
-                            containerInfo.containerId != 0)
-                        {
-                            _cachedRetainerMarketPrices[currentRetainer][containerInfo.slot] = containerInfo.unitPrice;
-                        }
-                    }
-                }
-            }
-            catch (Exception e)
-            {
-                _pluginLog.Error(e, "shits broke yo");
+                // Unreachable in practice: _containerInfoOriginal is assigned during startup,
+                // before the hook is enabled.
+                _pluginLog.Information(
+                    "ContainerInfo hook is gone mid-call and no original delegate is available; the packet was dropped.");
+                return null;
             }
 
-
-            return _itemMarketBoardInfoHook!.Original(seq, a3);
+            return original(seq, a3);
         }
-
 
         public void ParseBags()
         {
@@ -519,10 +497,10 @@ namespace CriticalCommonLib.Services
             }
             try
             {
-                if (_clientState.LocalContentId != 0 && _running)
+                if (_characterMonitor.LocalContentId != 0 && _running)
                 {
                     var changeSet = new BagChangeContainer();
-                    var inventorySortOrder = _odrScanner.GetSortOrder(_clientState.LocalContentId);
+                    var inventorySortOrder = _odrScanner.GetSortOrder(_characterMonitor.LocalContentId);
                     bool gearSetsChanged = false;
                     if (inventorySortOrder != null)
                     {
@@ -566,7 +544,7 @@ namespace CriticalCommonLib.Services
 
         public InventoryItem[] GetInventoryByType(ulong retainerId, InventoryType type)
         {
-            var bag = new Dictionary<ulong, InventoryItem[]>();
+            Dictionary<ulong, InventoryItem[]>? bag = null;
             switch (type)
             {
                 case InventoryType.RetainerPage1:
@@ -598,7 +576,7 @@ namespace CriticalCommonLib.Services
                     break;
             }
 
-            if (bag.ContainsKey(retainerId)) return bag[retainerId];
+            if (bag != null && bag.TryGetValue(retainerId, out var items)) return items;
 
             return Array.Empty<InventoryItem>();
         }
@@ -813,6 +791,7 @@ namespace CriticalCommonLib.Services
             GearSets.Clear();
             Array.Clear(GearSetsUsed);
             Array.Clear(GearSetNames);
+            System.Threading.Volatile.Write(ref _gearSetMembership, GearSetMembership.Empty);
 
             Array.Clear(HousingInteriorStoreroom1);
             Array.Clear(HousingInteriorStoreroom2);
@@ -933,6 +912,13 @@ namespace CriticalCommonLib.Services
             return gearSets;
         }
 
+        // 只在框架執行緒（ParseGearSets／ClearCache）換上新的一份；執行緒池上的重算只讀這份，不碰 GearSets／GearSetNames。
+        private GearSetMembership _gearSetMembership = GearSetMembership.Empty;
+
+        public GearSetMembership GetGearSetMembership() => System.Threading.Volatile.Read(ref _gearSetMembership);
+
+        internal void PublishGearSetMembership() => System.Threading.Volatile.Write(ref _gearSetMembership, GearSetMembership.FromSets(GetGearSets()));
+
         public Dictionary<uint, HashSet<(byte, string)>> GetGearSets()
         {
             Dictionary<uint, HashSet<(byte, string)>> gearSets = new();
@@ -949,6 +935,41 @@ namespace CriticalCommonLib.Services
         }
 
         private List<uint>? _currencyItemIds;
+
+        /// <summary>
+        /// 掃描用的暫存陣列：每次掃描重用，取出時一律清空（呼叫端只寫前段、後段必須是預設值）。
+        /// 只在框架執行緒上用（ParseBags 由 FrameworkOnUpdate 呼叫），同一時間各槽只有一個使用者。
+        /// </summary>
+        /// <remarks>槽位：0～3 人物／鞍囊（35）、4／5 兵裝庫（50／25）、6～12 僱員背包（25）、13 僱員出售中（20）。</remarks>
+        private readonly InventoryItem[]?[] _scratchBags = new InventoryItem[]?[14];
+
+        private static readonly InventoryType[] RetainerPageTypes =
+        {
+            InventoryType.RetainerPage1, InventoryType.RetainerPage2, InventoryType.RetainerPage3,
+            InventoryType.RetainerPage4, InventoryType.RetainerPage5
+        };
+
+        /// <summary>
+        /// 僱員沒有 ODR 排序時用的固定順序，只在 ParseRetainerBags 裡讀、不交給任何人。
+        /// 公開的 RetainerSortOrder.NoOdrOrder 仍每次給新的，呼叫端拿去改不會影響這份。
+        /// </summary>
+        private static readonly RetainerSortOrder NoOdrRetainerOrder = RetainerSortOrder.NoOdrOrder;
+
+        private InventoryItem[] ScratchBag(int slot, int length)
+        {
+            var buffer = _scratchBags[slot];
+            if (buffer == null || buffer.Length != length)
+            {
+                buffer = new InventoryItem[length];
+                _scratchBags[slot] = buffer;
+            }
+            else
+            {
+                Array.Clear(buffer);
+            }
+
+            return buffer;
+        }
 
         public unsafe void ParseCharacterBags(InventorySortOrder currentSortOrder, BagChangeContainer changeSet)
         {
@@ -971,10 +992,10 @@ namespace CriticalCommonLib.Services
                 InMemory.Add(InventoryType.Inventory4);
                 InMemory.Add(InventoryType.Crystals);
                 InMemory.Add(InventoryType.Currency);
-                var newBags1 = new InventoryItem[35];
-                var newBags2 = new InventoryItem[35];
-                var newBags3 = new InventoryItem[35];
-                var newBags4 = new InventoryItem[35];
+                var newBags1 = ScratchBag(0, 35);
+                var newBags2 = ScratchBag(1, 35);
+                var newBags3 = ScratchBag(2, 35);
+                var newBags4 = ScratchBag(3, 35);
                 var bagCount1 = 0;
                 var bagCount2 = 0;
                 var bagCount3 = 0;
@@ -1135,8 +1156,8 @@ namespace CriticalCommonLib.Services
                 {
                     InMemory.Add(InventoryType.SaddleBag1);
                     InMemory.Add(InventoryType.SaddleBag2);
-                    var newBags1 = new InventoryItem[35];
-                    var newBags2 = new InventoryItem[35];
+                    var newBags1 = ScratchBag(0, 35);
+                    var newBags2 = ScratchBag(1, 35);
                     var bagCount1 = 0;
                     var bagCount2 = 0;
                     for (var index = 0; index < saddleBagLeftSort.Count; index++)
@@ -1220,8 +1241,8 @@ namespace CriticalCommonLib.Services
                 {
                     InMemory.Add(InventoryType.PremiumSaddleBag1);
                     InMemory.Add(InventoryType.PremiumSaddleBag2);
-                    var newBags1 = new InventoryItem[35];
-                    var newBags2 = new InventoryItem[35];
+                    var newBags1 = ScratchBag(0, 35);
+                    var newBags2 = ScratchBag(1, 35);
                     var bagCount1 = 0;
                     var bagCount2 = 0;
                     for (var index = 0; index < saddleBagLeftSort.Count; index++)
@@ -1299,7 +1320,7 @@ namespace CriticalCommonLib.Services
                     var bagSpace = 35;
                     if (armoryChest.Value == InventoryType.ArmoryMainHand || armoryChest.Value == InventoryType.ArmoryRings) bagSpace = 50;
                     if (armoryChest.Value == InventoryType.ArmorySoulCrystal) bagSpace = 25;
-                    var newBags = new InventoryItem[bagSpace];
+                    var newBags = ScratchBag(bagSpace switch { 50 => 4, 25 => 5, _ => 0 }, bagSpace);
                     var odrOrdering = currentSortOrder.NormalInventories[armoryChest.Key];
                     var gameOrdering = InventoryManager.Instance()->GetInventoryContainer(armoryChest.Value);
 
@@ -1558,7 +1579,14 @@ namespace CriticalCommonLib.Services
 
                 if (!hasAgent)
                 {
-                    var agentFreeCompanyShop = AgentModule.Instance()->GetAgentByInternalId(AgentId.FreeCompanyCreditShop);
+                    // AgentModule.Instance() 自己會判空回 null，但不能直接解參考它去呼叫
+                    // GetAgentByInternalId()——那是 [MemberFunction]，null 的 this 會直接進原生碼
+                    // 解參考，產生 try/catch 攔不到的 AccessViolationException。取不到就當作
+                    // 沒有 agent（hasAgent 維持 false），下面本來就有「無法掃描」的處理路徑。
+                    var agentModule = AgentModule.Instance();
+                    var agentFreeCompanyShop = agentModule == null
+                        ? null
+                        : agentModule->GetAgentByInternalId(AgentId.FreeCompanyCreditShop);
                     if (agentFreeCompanyShop != null && agentFreeCompanyShop->IsAgentActive() && agentFreeCompanyShop->AddonId != 0)
                     {
                         hasAgent = true;
@@ -1571,9 +1599,30 @@ namespace CriticalCommonLib.Services
                     InMemory.Remove((InventoryType)Enums.InventoryType.FreeCompanyCurrency);
                     return;
                 }
-                var atkDataHolder = Framework.Instance()->UIModule->GetRaptureAtkModule()->AtkModule
-                    .AtkArrayDataHolder;
+                // 不可以寫成 Framework.Instance()->UIModule->GetRaptureAtkModule()->AtkModule.AtkArrayDataHolder：
+                // Framework.Instance() 是 [StaticAddress(isPointer: true)] 可能回 null，UIModule 是它的欄位也可能是 null，
+                // GetRaptureAtkModule() 是 [VirtualFunction(7)]——this 為 null 會從位址 0 讀 vtable，那是 try/catch 攔不到的
+                // AccessViolationException。RaptureAtkModule.Instance() 是 FFXIVClientStructs
+                // 寫好的判空版本，只需再擋它回 null。
+                var raptureAtkModule = FFXIVClientStructs.FFXIV.Client.UI.RaptureAtkModule.Instance();
+                if (raptureAtkModule == null)
+                {
+                    _pluginLog.Verbose("Cannot scan free company currency as the atk module is not available.");
+                    InMemory.Remove((InventoryType)Enums.InventoryType.FreeCompanyCurrency);
+                    return;
+                }
+
+                var atkDataHolder = raptureAtkModule->AtkModule.AtkArrayDataHolder;
+                // GetNumberArrayData 是原生呼叫，該陣列尚未配置時會回 null；
+                // 直接解參考 fcHolder->IntArray[9] 同樣是攔不到的 AccessViolation。
                 var fcHolder = atkDataHolder.GetNumberArrayData(52);
+                if (fcHolder == null)
+                {
+                    _pluginLog.Verbose("Cannot scan free company currency as the number array is not available.");
+                    InMemory.Remove((InventoryType)Enums.InventoryType.FreeCompanyCurrency);
+                    return;
+                }
+
                 var fcCredit = fcHolder->IntArray[9];
                 var fcRank = fcHolder->IntArray[4];
                 if (fcRank == 0)
@@ -1649,13 +1698,33 @@ namespace CriticalCommonLib.Services
         private DateTime? _glamourAgentOpened;
         public unsafe void ParseGlamourChest(BagChangeContainer changeSet)
         {
-            var agents = Framework.Instance()->UIModule->GetAgentModule();
-            var dresserAgent = (AgentMiragePrismPrismBox*)agents->GetAgentByInternalId(AgentId.MiragePrismPrismBox);
-            if (agents == null || dresserAgent == null || !dresserAgent->IsAgentActive())
+            // 不可以寫成 Framework.Instance()->UIModule->GetAgentModule()（只判最後那層的結果，
+            // 前面兩層仍是裸讀）。Framework.Instance() 是 [StaticAddress(isPointer: true)] 可能回
+            // null，UIModule 是它的欄位也可能是 null，而 GetAgentModule() 是 [VirtualFunction(37)]
+            // ——this 為 null 會從位址 0 讀 vtable，那是 try/catch 攔不到的 AccessViolationException。
+            // 用判空版 AgentModule.Instance()，取不到就沿用 agents == null 的處理。
+            var agents = AgentModule.Instance();
+            if (agents == null)
             {
                 _glamourAgentActive = false;
                 return;
             }
+
+            var dresserAgent = (AgentMiragePrismPrismBox*)agents->GetAgentByInternalId(AgentId.MiragePrismPrismBox);
+            if (dresserAgent == null || !dresserAgent->IsAgentActive())
+            {
+                _glamourAgentActive = false;
+                return;
+            }
+
+            // IsAgentActive() 不保證 Data 已配置：代理人本體與它的資料區塊生命週期不同步。
+            // 每次重取、顯式判空、同幀即用；為 null 時安靜跳過這一次讀取，下一幀再試。
+            var dresserData = dresserAgent->Data;
+            if (dresserData == null)
+            {
+                return;
+            }
+
             if (!_glamourAgentActive && _glamourAgentOpened == null)
             {
                 _glamourAgentOpened = DateTime.Now + _glamourAgentWait;
@@ -1676,7 +1745,7 @@ namespace CriticalCommonLib.Services
 
             for (var i = 0; i < 8000; i++)
             {
-                var chestItem = dresserAgent->Data->PrismBoxItems[i];
+                var chestItem = dresserData->PrismBoxItems[i];
                 var itemId = chestItem.ItemId;
                 if (itemId >= 1_000_000)
                 {
@@ -1693,7 +1762,7 @@ namespace CriticalCommonLib.Services
 
             for (var i = 0; i < 8000; i++)
             {
-                var chestItem = dresserAgent->Data->PrismBoxItems[i];
+                var chestItem = dresserData->PrismBoxItems[i];
                 var flags = InventoryItem.ItemFlags.None;
                 var itemId = chestItem.ItemId;
                 if (itemId >= 1_000_000)
@@ -1754,7 +1823,33 @@ namespace CriticalCommonLib.Services
                 _loadedInventories.Contains(InventoryType.RetainerMarket)
                )
             {
-                var marketOrder = _marketOrderService.GetCurrentOrder();
+                //Actual inventories
+                // GetInventoryContainer() 是 [MemberFunction]，容器尚未載入時回 null，直接解參考是 try/catch 攔不到的
+                // AccessViolationException。與 ParseCharacterBags 同一個 fail-closed 語意：全部容器非 null 才掃。
+                // 取得與判空刻意放在 InMemoryRetainers/RetainerBagN 的記帳之前：任一容器取不到就整個方法什麼都不做，
+                // 不會把「已在記憶體中」記上去卻只帶著一組全零的陣列給消費端，下一次掃描自然重試。
+                var retainerBag1 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage1);
+                var retainerBag2 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage2);
+                var retainerBag3 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage3);
+                var retainerBag4 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage4);
+                var retainerBag5 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage5);
+                var retainerBag6 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage6);
+                var retainerBag7 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage7);
+                var retainerEquippedItems =
+                    InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerEquippedItems);
+                var retainerMarketItems =
+                    InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerMarket);
+                var retainerGil = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerGil);
+                var retainerCrystal =
+                    InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerCrystals);
+
+                if (retainerBag1 == null || retainerBag2 == null || retainerBag3 == null || retainerBag4 == null ||
+                    retainerBag5 == null || retainerBag6 == null || retainerBag7 == null ||
+                    retainerEquippedItems == null || retainerMarketItems == null || retainerGil == null ||
+                    retainerCrystal == null)
+                {
+                    return;
+                }
 
                 if (!InMemoryRetainers.ContainsKey(currentRetainer))
                     InMemoryRetainers.Add(currentRetainer, new HashSet<InventoryType>());
@@ -1790,21 +1885,6 @@ namespace CriticalCommonLib.Services
                         RetainerGil.Add(currentRetainer, new InventoryItem[1]);
                     if (!RetainerCrystals.ContainsKey(currentRetainer))
                         RetainerCrystals.Add(currentRetainer, new InventoryItem[18]);
-                    //Actual inventories
-                    var retainerBag1 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage1);
-                    var retainerBag2 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage2);
-                    var retainerBag3 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage3);
-                    var retainerBag4 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage4);
-                    var retainerBag5 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage5);
-                    var retainerBag6 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage6);
-                    var retainerBag7 = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerPage7);
-                    var retainerEquippedItems =
-                        InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerEquippedItems);
-                    var retainerMarketItems =
-                        InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerMarket);
-                    var retainerGil = InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerGil);
-                    var retainerCrystal =
-                        InventoryManager.Instance()->GetInventoryContainer(InventoryType.RetainerCrystals);
 
                     RetainerSortOrder retainerInventory;
                     //Sort ordering
@@ -1814,7 +1894,7 @@ namespace CriticalCommonLib.Services
                     }
                     else
                     {
-                        retainerInventory = RetainerSortOrder.NoOdrOrder;
+                        retainerInventory = NoOdrRetainerOrder;
                     }
 
                     for (var i = 0; i < retainerEquippedItems->Size; i++)
@@ -1849,56 +1929,47 @@ namespace CriticalCommonLib.Services
                         }
                     }
 
-                    var retainerMarketCopy = new InventoryItem[20];
+                    var retainerMarketCopy = ScratchBag(13, 20);
 
-                    if (marketOrder != null)
+                    for (var i = 0; i < retainerMarketItems->Size; i++)
                     {
-
-                        for (var i = 0; i < retainerMarketItems->Size; i++)
-                        {
-                            if (marketOrder.TryGetValue(i, out var value))
-                            {
-                                retainerMarketCopy[value] = retainerMarketItems->Items[i];
-                            }
-                        }
-                    }
-                    else
-                    {
-                        for (var i = 0; i < retainerMarketItems->Size; i++)
-                        {
-                            retainerMarketCopy[i] = retainerMarketItems->Items[i];
-                        }
-
-                        retainerMarketCopy = _marketOrderService.SortByBackupRetainerMarketOrder(retainerMarketCopy.ToList()).ToArray();
+                        retainerMarketCopy[i] = retainerMarketItems->Items[i];
+                        retainerMarketCopy[i].Slot = (short)i;
                     }
 
-                    retainerMarketCopy = retainerMarketCopy.ToArray();
-                    for (var i = 0; i < retainerMarketCopy.Length; i++)
+                    // 原地排序：這個暫存槽只在這裡用，排完直接讀它。
+                    _marketOrderService.SortByRetainerMarketOrderInPlace(retainerMarketCopy);
+
+                    var trueSlot = 0;
+                    foreach (var marketItem in retainerMarketCopy)
                     {
-                        var retainerItem = retainerMarketCopy[i];
-                        if (_cachedRetainerMarketPrices.ContainsKey(currentRetainer))
+                        var retainerItem = marketItem;
+                        uint gamePrice = 0;
+                        if (retainerItem.ItemId != 0)
                         {
-                            var cachedPrice = _cachedRetainerMarketPrices[currentRetainer][retainerItem.Slot];
-                            retainerItem.Slot = (short)i;
-                            if (!retainerItem.IsSame(RetainerMarket[currentRetainer][i]) ||
-                                cachedPrice != RetainerMarketPrices[currentRetainer][i])
-                            {
-                                RetainerMarket[currentRetainer][i] = retainerItem;
-                                RetainerMarketPrices[currentRetainer][i] = cachedPrice;
-                                changeSet.Add(new BagChange(retainerItem, InventoryType.RetainerMarket));
-                            }
+                            gamePrice = (uint)InventoryManager.Instance()->GetRetainerMarketPrice(retainerItem.Slot);
                         }
+
+                        retainerItem.Slot = (short)trueSlot;
+                        var itemDifferent = !retainerItem.IsSame(RetainerMarket[currentRetainer][trueSlot]);
+                        var priceDifferent = gamePrice != RetainerMarketPrices[currentRetainer][trueSlot];
+                        if (itemDifferent || priceDifferent)
+                        {
+                            RetainerMarket[currentRetainer][trueSlot] = retainerItem;
+                            RetainerMarketPrices[currentRetainer][trueSlot] = gamePrice;
+                            changeSet.Add(new BagChange(retainerItem, InventoryType.RetainerMarket));
+                        }
+
+                        trueSlot++;
                     }
-                    //Probably some way we can calculate the order then just update that
 
-
-                    var newBags1 = new InventoryItem[25];
-                    var newBags2 = new InventoryItem[25];
-                    var newBags3 = new InventoryItem[25];
-                    var newBags4 = new InventoryItem[25];
-                    var newBags5 = new InventoryItem[25];
-                    var newBags6 = new InventoryItem[25];
-                    var newBags7 = new InventoryItem[25];
+                    var newBags1 = ScratchBag(6, 25);
+                    var newBags2 = ScratchBag(7, 25);
+                    var newBags3 = ScratchBag(8, 25);
+                    var newBags4 = ScratchBag(9, 25);
+                    var newBags5 = ScratchBag(10, 25);
+                    var newBags6 = ScratchBag(11, 25);
+                    var newBags7 = ScratchBag(12, 25);
                     var bagCount1 = 0;
                     var bagCount2 = 0;
                     var bagCount3 = 0;
@@ -1981,11 +2052,7 @@ namespace CriticalCommonLib.Services
                         }
                     }
 
-                    var retainerBags = new List<InventoryType>
-                    {
-                        InventoryType.RetainerPage1, InventoryType.RetainerPage2, InventoryType.RetainerPage3,
-                        InventoryType.RetainerPage4, InventoryType.RetainerPage5
-                    };
+                    IReadOnlyList<InventoryType> retainerBags = RetainerPageTypes;
                     var absoluteIndex = 0;
                     for (var index = 0; index < newBags1.Length; index++)
                     {
@@ -2132,60 +2199,124 @@ namespace CriticalCommonLib.Services
         public unsafe bool ParseGearSets(BagChangeContainer changeSet)
         {
             bool gearSetsChanged = false;
+            // GetGearSets() 讀得到的三樣（GearSets 的鍵、各欄物品、GearSetNames）有任何一樣變了才重建快照。
+            bool membershipChanged = false;
             var gearSetModule = RaptureGearsetModule.Instance();
             if (gearSetModule == null)
             {
                 return false;
             }
 
-            for (byte i = 0; i < gearSetModule->Entries.Length; i++)
+            Span<uint> itemIds = stackalloc uint[GearSetItemSlots.Length];
+            try
             {
-                var gearSet = gearSetModule->Entries[i];
-                if (gearSet.Flags.HasFlag(RaptureGearsetModule.GearsetFlag.Exists))
+                for (byte i = 0; i < gearSetModule->Entries.Length; i++)
                 {
-                    if (GearSetsUsed[i] != true)
+                    var gearSet = gearSetModule->Entries[i];
+                    if (gearSet.Flags.HasFlag(RaptureGearsetModule.GearsetFlag.Exists))
                     {
-                        GearSetsUsed[i] = true;
-                        gearSetsChanged = true;
-                    }
+                        for (var index = 0; index < GearSetItemSlots.Length; index++)
+                        {
+                            itemIds[index] = gearSet.GetItem(GearSetItemSlots[index]).ItemId;
+                        }
 
-                    var gearSetName = gearSet.NameString;
-                    GearSetNames[i] = gearSetName;
-
-
-
-                    var gearSetItems = new[]
-                    {
-                        gearSet.GetItem(RaptureGearsetModule.GearsetItemIndex.MainHand), gearSet.GetItem(RaptureGearsetModule.GearsetItemIndex.OffHand), gearSet.GetItem(RaptureGearsetModule.GearsetItemIndex.Head), gearSet.GetItem(RaptureGearsetModule.GearsetItemIndex.Body), gearSet.GetItem(RaptureGearsetModule.GearsetItemIndex.Hands),
-                        gearSet.GetItem(RaptureGearsetModule.GearsetItemIndex.Legs), gearSet.GetItem(RaptureGearsetModule.GearsetItemIndex.Feet), gearSet.GetItem(RaptureGearsetModule.GearsetItemIndex.Ears), gearSet.GetItem(RaptureGearsetModule.GearsetItemIndex.Neck), gearSet.GetItem(RaptureGearsetModule.GearsetItemIndex.Wrists), gearSet.GetItem(RaptureGearsetModule.GearsetItemIndex.RingRight),
-                        gearSet.GetItem(RaptureGearsetModule.GearsetItemIndex.RingLeft), gearSet.GetItem(RaptureGearsetModule.GearsetItemIndex.SoulStone)
-                    };
-                    if (!GearSets.ContainsKey(i))
-                    {
-                        GearSets.Add(i, new uint[gearSetItems.Length]);
-                    }
-                    for (var index = 0; index < gearSetItems.Length; index++)
-                    {
-                        var gearSetItem = gearSetItems[index];
-                        var itemId = gearSetItem.ItemId;
-                        if (GearSets[i][index] != itemId)
+                        if (StoreGearSet(i, GearSetName(i, ref gearSet), itemIds, ref membershipChanged))
                         {
                             gearSetsChanged = true;
-                            GearSets[i][index] = itemId;
+                        }
+                    }
+                    else
+                    {
+                        if (GearSetsUsed[i] != false)
+                        {
+                            gearSetsChanged = true;
+                            GearSetsUsed[i] = false;
                         }
                     }
                 }
-                else
+            }
+            finally
+            {
+                // 迴圈中途擲例外時已寫進 GearSets 的部分也要換上，否則要等下一次有變才會更新。
+                if (membershipChanged)
                 {
-                    if (GearSetsUsed[i] != false)
-                    {
-                        gearSetsChanged = true;
-                        GearSetsUsed[i] = false;
-                    }
+                    PublishGearSetMembership();
                 }
             }
 
             return gearSetsChanged;
+        }
+
+        /// <summary>
+        /// <see cref="ParseGearSets"/> 對一組存在的套裝做的事：記下名稱與各欄物品。
+        /// 回傳 true＝GearSetsUsed 或欄位物品有變；<paramref name="membershipChanged"/> 在 GetGearSets() 的內容可能變了時設 true。
+        /// </summary>
+        internal bool StoreGearSet(byte i, string name, ReadOnlySpan<uint> itemIds, ref bool membershipChanged)
+        {
+            var changed = false;
+            if (GearSetsUsed[i] != true)
+            {
+                GearSetsUsed[i] = true;
+                changed = true;
+            }
+
+            if (!string.Equals(GearSetNames[i], name, StringComparison.Ordinal))
+            {
+                membershipChanged = true;
+            }
+
+            GearSetNames[i] = name;
+
+            if (!GearSets.TryGetValue(i, out var storedItems))
+            {
+                storedItems = new uint[GearSetItemSlots.Length];
+                GearSets.Add(i, storedItems);
+                membershipChanged = true;
+            }
+
+            for (var index = 0; index < storedItems.Length; index++)
+            {
+                if (storedItems[index] != itemIds[index])
+                {
+                    changed = true;
+                    membershipChanged = true;
+                    storedItems[index] = itemIds[index];
+                }
+            }
+
+            return changed;
+        }
+
+        // GearSets[i] 的欄位順序（不含腰帶）；ParseGearSets 每 500 ms 跑一次，所以不每次新建陣列。
+        private static readonly RaptureGearsetModule.GearsetItemIndex[] GearSetItemSlots =
+        {
+            RaptureGearsetModule.GearsetItemIndex.MainHand, RaptureGearsetModule.GearsetItemIndex.OffHand, RaptureGearsetModule.GearsetItemIndex.Head, RaptureGearsetModule.GearsetItemIndex.Body, RaptureGearsetModule.GearsetItemIndex.Hands,
+            RaptureGearsetModule.GearsetItemIndex.Legs, RaptureGearsetModule.GearsetItemIndex.Feet, RaptureGearsetModule.GearsetItemIndex.Ears, RaptureGearsetModule.GearsetItemIndex.Neck, RaptureGearsetModule.GearsetItemIndex.Wrists, RaptureGearsetModule.GearsetItemIndex.RingRight,
+            RaptureGearsetModule.GearsetItemIndex.RingLeft, RaptureGearsetModule.GearsetItemIndex.SoulStone
+        };
+
+        private const int GearSetNameBytes = 48;
+        private readonly byte[] _gearSetNameRaw = new byte[100 * GearSetNameBytes];
+        private readonly string?[] _gearSetNameDecoded = new string?[100];
+
+        // 名稱欄的 48 個位元組跟上次相同就沿用上次解出的字串，不同才重新解碼。
+        // 欄內沒有結尾 0 時 NameString 會讀到欄位之外，那種情況一律重新解碼、不走快取。
+        private string GearSetName(int index, ref RaptureGearsetModule.GearsetEntry gearSet)
+        {
+            var raw = gearSet.Name;
+            var cachedRaw = _gearSetNameRaw.AsSpan(index * GearSetNameBytes, GearSetNameBytes);
+            var cached = _gearSetNameDecoded[index];
+            if (cached == null || raw.Length != GearSetNameBytes || raw.IndexOf((byte)0) < 0 || !raw.SequenceEqual(cachedRaw))
+            {
+                cached = gearSet.NameString;
+                _gearSetNameDecoded[index] = cached;
+                if (raw.Length == GearSetNameBytes)
+                {
+                    raw.CopyTo(cachedRaw);
+                }
+            }
+
+            return cached;
         }
 
         private bool _disposed;
@@ -2247,36 +2378,23 @@ namespace CriticalCommonLib.Services
         {
             if(!_disposed && disposing)
             {
-                _pluginLog.Verbose("Disposing {type} ({this})", GetType().Name, this);
+                _pluginLog?.Verbose("Disposing {type} ({this})", GetType().Name, this);
                 _running = false;
-                _framework.Update -= FrameworkOnUpdate;
+                if (_framework != null) _framework.Update -= FrameworkOnUpdate;
                 _containerInfoNetworkHook?.Dispose();
-                _itemMarketBoardInfoHook?.Dispose();
                 _containerInfoNetworkHook = null;
-                _itemMarketBoardInfoHook = null;
-                _clientState.Logout -= ClientStateOnLogout;
-                _characterMonitor.OnActiveRetainerChanged -= CharacterMonitorOnOnActiveRetainerChanged;
-                _characterMonitor.OnCharacterUpdated -= CharacterMonitorOnOnCharacterUpdated;
-                _characterMonitor.OnActiveFreeCompanyChanged -= CharacterMonitorOnOnActiveFreeCompanyChanged;
-                _characterMonitor.OnActiveHouseChanged -= CharacterMonitorOnOnActiveHouseChanged;
-                _odrScanner.OnSortOrderChanged -= SortOrderChanged;
-                _gameUiManager.UiVisibilityChanged -= GameUiManagerOnUiManagerVisibilityChanged;
+                if (_clientState != null) _clientState.Logout -= ClientStateOnLogout;
+                if (_characterMonitor != null)
+                {
+                    _characterMonitor.OnActiveRetainerChanged -= CharacterMonitorOnOnActiveRetainerChanged;
+                    _characterMonitor.OnCharacterUpdated -= CharacterMonitorOnOnCharacterUpdated;
+                    _characterMonitor.OnActiveFreeCompanyChanged -= CharacterMonitorOnOnActiveFreeCompanyChanged;
+                    _characterMonitor.OnActiveHouseChanged -= CharacterMonitorOnOnActiveHouseChanged;
+                }
+                if (_odrScanner != null) _odrScanner.OnSortOrderChanged -= SortOrderChanged;
+                if (_gameUiManager != null) _gameUiManager.UiVisibilityChanged -= GameUiManagerOnUiManagerVisibilityChanged;
             }
             _disposed = true;
-        }
-
-        ~InventoryScanner()
-        {
-#if DEBUG
-            // In debug-builds, make sure that a warning is displayed when the Disposable object hasn't been
-            // disposed by the programmer.
-
-            if( _disposed == false )
-            {
-                _pluginLog.Error("There is a disposable object which hasn't been disposed before the finalizer call: " + (GetType ().Name));
-            }
-#endif
-            Dispose (true);
         }
     }
 

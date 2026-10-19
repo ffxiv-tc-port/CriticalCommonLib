@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using AllaganLib.Shared.Interfaces;
 using AllaganLib.Shared.Services;
+using CriticalCommonLib.Helpers;
 using CriticalCommonLib.Interfaces;
 using Dalamud.Plugin.Services;
 using Lumina.Excel;
@@ -24,24 +25,134 @@ public class HostedUniversalis : BackgroundService, IUniversalis
     private readonly ExcelSheet<World> _worldSheet;
     private readonly IFramework _framework;
     private readonly IHostedUniversalisConfiguration _hostedUniversalisConfiguration;
+    private readonly UniversalisAvailability _universalisAvailability;
+    private readonly ConcurrentDictionary<uint, byte> _notFoundLoggedWorlds = new();
+
+    /// <summary>
+    /// 已經吼過「請求形狀不對」的(世界 id, HTTP 狀態碼)。這一類重試不會變好,所以每種
+    /// 只寫一次 Error,不進退避迴圈。
+    /// </summary>
+    private readonly ConcurrentDictionary<(uint, int), byte> _badRequestLoggedWorlds = new();
+
+    /// <summary>
+    /// 已經寫過「第一次查價成功」的世界。讓使用者在 log 裡看得到「有成功」,不只看得到失敗。
+    /// </summary>
+    private readonly ConcurrentDictionary<uint, byte> _successLoggedWorlds = new();
+
+    /// <summary>
+    /// 第一次與恢復之外的成功只累計，每 <see cref="SuccessSummaryInterval"/> 寫一行彙總（卸載時把剩下的寫掉）。
+    /// 鎖只護這兩個欄位；鎖內只組字串，寫 log 在鎖外。
+    /// </summary>
+    private readonly object _successTallyLock = new();
+    private readonly Dictionary<string, (int Batches, int Items)> _successTally = new();
+    private long _successTallyStartTicks;
+    private static readonly TimeSpan SuccessSummaryInterval = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// 每個世界目前連續失敗幾次。成功一次就清掉,清掉的時候寫一則「已恢復」。
+    /// </summary>
+    private readonly ConcurrentDictionary<uint, int> _worldFailureStreak = new();
+
+    /// <summary>
+    /// 每個世界目前的批次上限。「一次查太多筆」會讓 universalis 的原站來不及回應,邊界(Cloudflare)直接回
+    /// 504,所以遇到暫時性錯誤時把批次調小再送。⚠️ 最小批也不是零失敗,拆到最小之後仍然要有退避重試。
+    /// 預設值是 MaxBatchSize,只有實際失敗過的世界才會被調小,而且調小之後這個 session 內不再自動調回去
+    /// (避免在上限附近來回震盪、反覆吐警告);重載外掛就會回到預設值。
+    /// </summary>
+    private readonly ConcurrentDictionary<uint, int> _worldBatchSize = new();
+
+    /// <summary>
+    /// 連續失敗太多次的世界,暫停到這個時間點為止。
+    ///
+    /// 沒有這個閘門的話,最壞情況(universalis 真的掛了)是 50 筆拆成 2x25、4x12、8x10,
+    /// 八個最小批各自做兩輪退避,而這條佇列的並行度是 1 ⇒ 一批就能把佇列堵上半小時。
+    /// 有了它,一個壞掉的世界最多送出 FailureStreakBeforeCooldown 次失敗請求就安靜下來。
+    /// 成功一次就解除。
+    /// </summary>
+    private readonly ConcurrentDictionary<uint, DateTime> _worldCooldownUntil = new();
+
+    /// <summary>
+    /// 連續失敗幾次之後暫停這個世界的查價。
+    /// </summary>
+    private const int FailureStreakBeforeCooldown = 5;
+
+    /// <summary>
+    /// 暫停多久。
+    /// </summary>
+    private static readonly TimeSpan CooldownDuration = TimeSpan.FromMinutes(5);
+    /// <summary>
+    /// 一次最多查幾筆。
+    /// </summary>
+    private const int MaxBatchSize = 50;
+
+    /// <summary>
+    /// 批次調小的下限。實測台服世界在這個大小下失敗率約 5%(不是零),所以拆到這個
+    /// 大小之後就不再往下拆,改成指數退避重試。
+    /// </summary>
+    private const int MinBatchSize = 10;
+
+    /// <summary>
+    /// 目前是否還有任何世界查得到 universalis 資料。判定細節在 UniversalisAvailability:
+    /// 依據 universalis 自己的世界清單逐個世界判定,不按客戶端語言一刀切。
+    /// </summary>
+    public bool MarketApiAvailable => _universalisAvailability.MarketDataAvailable;
+
     public ILogger<HostedUniversalis> Logger { get; }
     public HttpClient HttpClient { get; }
     public BackgroundTaskQueue UniversalisQueue { get; }
     private Dictionary<uint, string> _worldNames = new();
     public uint QueueTime { get; } = 5;
-    public uint MaxRetries { get; } = 3;
-    public DateTime? LastFailure { get; private set; }
-    public bool TooManyRequests { get; private set; }
 
-    public int QueuedCount => _queuedCount;
+    /// <summary>
+    /// 同一批道具最多走幾層處理。拆批也算一層(拆批本身就是「換一個比較小的請求再試」),
+    /// 所以要夠讓 50 → 25 → 12 → 10 這條路走得完。
+    /// </summary>
+    public uint MaxRetries { get; } = 5;
+
+    /// <summary>
+    /// <see cref="LastFailure"/> 的存放處,存 Ticks + 1 ——
+    /// DateTime.MinValue.Ticks 就是 0,會和「還沒失敗過」的哨兵值撞在一起。
+    /// </summary>
+    private long _lastFailureTicks;
+
+    /// <summary>
+    /// 最近一次查價失敗的時間;null = 沒失敗過,或已經成功而被清掉。
+    /// 🔴 背景查價工作寫、ImGui 繪製執行緒讀,兩邊都不拿鎖 ⇒ DateTime? 的
+    ///    16 bytes 指派不是原子的,會讀到半套。
+    /// </summary>
+    public DateTime? LastFailure
+    {
+        get
+        {
+            var ticks = Volatile.Read(ref _lastFailureTicks);
+            return ticks == 0 ? null : new DateTime(ticks - 1, DateTimeKind.Local);
+        }
+        private set => Volatile.Write(ref _lastFailureTicks,
+            value is null ? 0L : value.Value.Ticks + 1);
+    }
+
+    private int _tooManyRequestsFlag;
+
+    /// <summary>
+    /// 讀寫兩端同 <see cref="LastFailure"/>。bool 不會撕裂,但沒有屏障會一直讀到舊值。
+    /// </summary>
+    public bool TooManyRequests
+    {
+        get => Volatile.Read(ref _tooManyRequestsFlag) != 0;
+        private set => Volatile.Write(ref _tooManyRequestsFlag, value ? 1 : 0);
+    }
+
+    /// <summary>寫入端走 Interlocked,這裡只需要一道讀取屏障。</summary>
+    public int QueuedCount => Volatile.Read(ref _queuedCount);
 
 
-    public HostedUniversalis(ILogger<HostedUniversalis> logger, UniversalisUserAgent userAgent, HttpClient httpClient, BackgroundTaskQueue.Factory taskQueueFactory, ExcelSheet<World> worldSheet, IFramework framework, IHostedUniversalisConfiguration hostedUniversalisConfiguration)
+    public HostedUniversalis(ILogger<HostedUniversalis> logger, UniversalisUserAgent userAgent, HttpClient httpClient, BackgroundTaskQueue.Factory taskQueueFactory, ExcelSheet<World> worldSheet, IFramework framework, IHostedUniversalisConfiguration hostedUniversalisConfiguration, UniversalisAvailability universalisAvailability)
     {
         _userAgent = userAgent;
         _worldSheet = worldSheet;
         _framework = framework;
         _hostedUniversalisConfiguration = hostedUniversalisConfiguration;
+        _universalisAvailability = universalisAvailability;
         Logger = logger;
         HttpClient = httpClient;
         httpClient.DefaultRequestHeaders.Add("User-Agent", $"AllaganTools/{_userAgent.PluginVersion}");
@@ -51,29 +162,88 @@ public class HostedUniversalis : BackgroundService, IUniversalis
 
     private void FrameworkOnUpdate(IFramework framework)
     {
-        foreach (var world in _queueWorldItemIds)
+        var worlds = _queueEnumerator.Begin(_queueWorldItemIds);
+        while (worlds.MoveNext())
         {
+            var world = worlds.Current;
             if (world.Value.Item1 < DateTime.Now)
             {
-                _queueWorldItemIds.Remove(world.Key, out var fullList);
-                _queuedCount += fullList.Item2.Count;
-                UniversalisQueue.QueueBackgroundWorkItemAsync(token => RetrieveMarketBoardPrices(fullList.Item2, world.Key,token));
+                QueueDueWorld(world.Key);
                 break;
             }
         }
+    }
+
+    // lambda 放在這裡而不是迴圈裡：捕獲迴圈變數時，每一輪開頭就配置閉包物件（沒到期的那幾輪也是）。
+    private void QueueDueWorld(uint worldId)
+    {
+        _queueWorldItemIds.Remove(worldId, out var fullList);
+        Interlocked.Add(ref _queuedCount, fullList.Item2.Count);
+        UniversalisQueue.QueueBackgroundWorkItemAsync(token => RetrieveMarketBoardPrices(fullList.Item2, worldId,token));
     }
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
         Logger.LogTrace("Stopping service {Type} ({This})", GetType().Name, this);
         await base.StopAsync(cancellationToken);
+        FlushSuccessTally();
         Logger.LogTrace("Stopped service {Type} ({This})", GetType().Name, this);
     }
 
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        await BackgroundProcessing(stoppingToken);
+        // 停用外掛或關閉遊戲時 stoppingToken 被取消是正常收工，刻意吞掉不記成錯誤。
+        try
+        {
+            await LoadKnownWorldsAsync(stoppingToken);
+            await BackgroundProcessing(stoppingToken);
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+        }
+    }
+
+    /// <summary>
+    /// 取一次 universalis 認得的世界清單,拿它當「這個世界查不查得到」的判準。
+    /// 取不到就什麼都不做:UniversalisAvailability 會維持樂觀模式照樣送請求。
+    /// </summary>
+    private async Task LoadKnownWorldsAsync(CancellationToken token)
+    {
+        try
+        {
+            var response = await HttpClient.GetAsync("https://universalis.app/api/v2/worlds", token);
+            if (!response.IsSuccessStatusCode)
+            {
+                Logger.LogInformation(
+                    "取得 universalis 世界清單失敗(HTTP {StatusCode}),本次改用樂觀模式:照樣送出查價請求。",
+                    (int)response.StatusCode);
+                return;
+            }
+
+            var value = await response.Content.ReadAsStringAsync(token);
+            var worlds = JsonConvert.DeserializeObject<List<UniversalisWorld>>(value);
+            if (worlds == null || worlds.Count == 0)
+            {
+                Logger.LogInformation(
+                    "universalis 世界清單解析不出內容,本次改用樂觀模式:照樣送出查價請求。");
+                return;
+            }
+
+            _universalisAvailability.SetKnownWorlds(worlds.Select(c => c.id));
+            Logger.LogInformation(
+                "universalis 認得 {Count} 個世界,查價會依這份清單過濾。",
+                worlds.Count);
+        }
+        catch (TaskCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            Logger.LogInformation(
+                ex,
+                "取得 universalis 世界清單時發生例外,本次改用樂觀模式:照樣送出查價請求。");
+        }
     }
 
     private async Task BackgroundProcessing(CancellationToken stoppingToken)
@@ -95,7 +265,7 @@ public class HostedUniversalis : BackgroundService, IUniversalis
         }
     }
 
-    public event Universalis.ItemPriceRetrievedDelegate? ItemPriceRetrieved;
+    public event ItemPriceRetrievedDelegate? ItemPriceRetrieved;
     public void SetSaleHistoryLimit(int limit)
     {
     }
@@ -106,49 +276,352 @@ public class HostedUniversalis : BackgroundService, IUniversalis
 
     public void QueuePriceCheck(uint itemId, uint worldId)
     {
-        if (worldId == 0)
+        // universalis 認不得的世界(以及還沒登入、拿不到世界時的 worldId 0)直接丟掉,
+        // 不排程也不記錄(這個方法會被表格的每一列呼叫,記 log 會洗版)。
+        if (!_universalisAvailability.IsWorldSupported(worldId))
         {
             return;
         }
         _queueWorldItemIds.TryAdd(worldId, (DateTime.Now.AddSeconds(QueueTime), []));
         _queueWorldItemIds[worldId].Item2.Add(itemId);
-        if (_queueWorldItemIds[worldId].Item2.Count == 50)
+        if (_queueWorldItemIds[worldId].Item2.Count == MaxBatchSize)
         {
             _queueWorldItemIds.Remove(worldId, out var fullList);
-            _queuedCount += fullList.Item2.Count;
+            Interlocked.Add(ref _queuedCount, fullList.Item2.Count);
             UniversalisQueue.QueueBackgroundWorkItemAsync(token => RetrieveMarketBoardPrices(fullList.Item2, worldId,token));
         }
     }
 
     private ConcurrentDictionary<uint, (DateTime,HashSet<uint>)> _queueWorldItemIds = new();
+    private readonly ReusableDictionaryEnumerator<uint, (DateTime,HashSet<uint>)> _queueEnumerator = new();
     private int _queuedCount;
+
+    private void ReleaseQueued(int count)
+    {
+        if (count > 0)
+        {
+            Interlocked.Add(ref _queuedCount, -count);
+        }
+    }
+
+    private int GetBatchSize(uint worldId)
+    {
+        return _worldBatchSize.TryGetValue(worldId, out var size) ? size : MaxBatchSize;
+    }
+
+    /// <summary>
+    /// 這個 HTTP 狀態碼算不算「等一下再試就可能會好」。
+    ///
+    /// 5xx 一律算(含 Cloudflare 自己的 520/521/522/523/524——universalis 擋在 Cloudflare
+    /// 後面,原站慢的時候回的是這些碼而不是 universalis 自己的錯誤)。
+    /// 408/425 也算。其餘 4xx 都是「請求本身不對」,重試不會變好。
+    /// </summary>
+    private static bool IsTransientStatus(HttpStatusCode? statusCode)
+    {
+        if (statusCode == null)
+        {
+            // 連線失敗、DNS、TLS、逾時——都當成暫時性。
+            return true;
+        }
+
+        var code = (int)statusCode.Value;
+        return code == 408 || code == 425 || code >= 500;
+    }
+
+    /// <summary>
+    /// 一批道具最多取回幾筆成交紀錄。
+    ///
+    /// 🔴 這同時是「N 日成交數」的上界:取回幾筆,那個數字就最多是幾。
+    ///    時間窗由 entriesWithin 決定,所以這個值只要夠大就不影響正確性;
+    ///    設定容許的最大時間窗是 30 天,實測單一道具約 900 筆,這裡留兩倍餘裕。
+    /// </summary>
+    private const int HistoryEntriesToReturn = 2000;
+
+    private readonly ConcurrentDictionary<uint, byte> _historyUnavailableLoggedWorlds = new();
+
+    private int _historySuccessCount;
+    private int _historyFailureCount;
+    private long _historyWindowStartTicks = DateTime.UtcNow.Ticks;
+    private static readonly long HistorySummaryIntervalTicks = TimeSpan.FromHours(1).Ticks;
+
+    /// <summary>
+    /// 查這一批道具的成交歷史,填進各自的 <c>recentHistory</c>。
+    ///
+    /// ⚠️ 這支不擲例外、也不動世界的可用性判定與重試計數:成交歷史只餵
+    ///    「N 日成交數」與「最後成交日期」,拿不到的代價是那兩個值留空,
+    ///    價格本身照樣送得出去。把它併進主請求的失敗處理會讓價格一起掉。
+    /// </summary>
+    private async Task MergeRecentHistoryAsync(List<PricingAPIResponse> pricings, string itemIdsString,
+        int itemCount, uint worldId, string worldName, CancellationToken token)
+    {
+        if (pricings.Count == 0 || token.IsCancellationRequested)
+        {
+            return;
+        }
+
+        // entriesWithin 讓時間窗對上使用者設定的天數,否則這個端點只給大約 7 天,
+        // 把上限調到 7 天以上的人會拿到偏少的成交數。
+        var withinSeconds = Math.Max(1, _hostedUniversalisConfiguration.SaleHistoryLimit) * 86400L;
+        var url = $"https://universalis.app/api/v2/history/{worldName}/{itemIdsString}"
+                  + $"?entriesWithin={withinSeconds}&entriesToReturn={HistoryEntriesToReturn}";
+
+        try
+        {
+            var response = await HttpClient.GetAsync(url, token);
+            if (!response.IsSuccessStatusCode)
+            {
+                ReportHistoryUnavailable(worldId, worldName, ((int)response.StatusCode).ToString());
+                return;
+            }
+
+            var value = await response.Content.ReadAsStringAsync(token);
+            if (!LooksLikeJson(value))
+            {
+                ReportHistoryUnavailable(worldId, worldName, Snippet(value));
+                return;
+            }
+
+            var byItem = new Dictionary<uint, RecentHistory[]?>();
+            if (itemCount == 1)
+            {
+                var single = JsonConvert.DeserializeObject<HistoryAPIResponse>(value);
+                if (single != null)
+                {
+                    byItem[single.itemID] = single.entries;
+                }
+            }
+            else
+            {
+                var multi = JsonConvert.DeserializeObject<HistoryMultiRequest>(value);
+                if (multi?.items != null)
+                {
+                    foreach (var entry in multi.items.Values)
+                    {
+                        byItem[entry.itemID] = entry.entries;
+                    }
+                }
+            }
+
+            foreach (var pricing in pricings)
+            {
+                // 沒有成交資料的道具會整筆缺席,那不是錯誤 —— 留 null 讓
+                // MarketPricing 走「沒有歷史」那條路。
+                if (byItem.TryGetValue(pricing.itemID, out var entries))
+                {
+                    pricing.recentHistory = entries;
+                    if (entries != null && entries.Length >= HistoryEntriesToReturn)
+                    {
+                        ReportHistoryTruncated(pricing.itemID, entries.Length);
+                    }
+                }
+            }
+
+            RecordHistoryOutcome(true);
+        }
+        catch (OperationCanceledException)
+        {
+            // 關閉/登出,或 HttpClient 自己逾時。成交歷史不是必需品。
+        }
+        catch (HttpRequestException ex)
+        {
+            ReportHistoryUnavailable(worldId, worldName, ex.Message);
+        }
+    }
+
+    private int _historyTruncationLogged;
+
+    /// <summary>
+    /// 取回的筆數頂到上限 ⇒ 這個道具的「N 日成交數」是下界而不是真值。
+    /// 整個 session 只寫一次。
+    /// </summary>
+    private void ReportHistoryTruncated(uint itemId, int count)
+    {
+        if (Interlocked.Exchange(ref _historyTruncationLogged, 1) == 0)
+        {
+            Logger.LogInformation(
+                "universalis 的成交歷史取回筆數頂到上限(道具 {ItemId} 拿到 {Count} 筆),"
+                + "這類成交極頻繁的道具,畫面上的「N 日成交數」會偏低。只提醒一次。",
+                itemId, count);
+        }
+    }
+
+    /// <summary>
+    /// 每個世界只提醒一次,避免變成另一種形式的洗版。
+    /// </summary>
+    private void ReportHistoryUnavailable(uint worldId, string worldName, string reason)
+    {
+        RecordHistoryOutcome(false);
+        if (_historyUnavailableLoggedWorlds.TryAdd(worldId, default))
+        {
+            Logger.LogInformation(
+                "universalis 對世界「{WorldName}」(id {WorldId})的成交歷史查不到({Reason})。"
+                + "價格與掛售不受影響,只有「N 日成交數」與最後成交日期會是空的。每個世界只提醒一次。",
+                worldName, worldId, reason);
+        }
+    }
+
+    /// <summary>
+    /// 每小時彙總一次成交歷史的成敗，只在這一小時真的有失敗時寫。
+    /// 逐世界的首次 Information 仍然照舊，這裡補的是「之後還在不在失敗」。
+    ///
+    /// 跑在執行緒池（HttpClient 的延續）上，所以全程 Interlocked；
+    /// CAS 換窗口起點讓同一個窗口只有一條執行緒寫得出來。
+    /// </summary>
+    private void RecordHistoryOutcome(bool success)
+    {
+        if (success)
+        {
+            Interlocked.Increment(ref _historySuccessCount);
+        }
+        else
+        {
+            Interlocked.Increment(ref _historyFailureCount);
+        }
+
+        var now = DateTime.UtcNow.Ticks;
+        var windowStart = Interlocked.Read(ref _historyWindowStartTicks);
+        if (now - windowStart < HistorySummaryIntervalTicks)
+        {
+            return;
+        }
+
+        if (Interlocked.CompareExchange(ref _historyWindowStartTicks, now, windowStart) != windowStart)
+        {
+            return;
+        }
+
+        var failures = Interlocked.Exchange(ref _historyFailureCount, 0);
+        var successes = Interlocked.Exchange(ref _historySuccessCount, 0);
+        if (failures == 0)
+        {
+            return;
+        }
+
+        Logger.LogInformation(
+            "本小時 成交歷史 成功 {Successes} / 失敗 {Failures}。"
+            + "價格與掛售不受影響，只有「N 日成交數」與最後成交日期會是空的。",
+            successes, failures);
+    }
+
+    /// <summary>
+    /// 這段回應內容「看起來」是不是 JSON。先看 HTTP 狀態碼,再用這個守衛擋「狀態碼是 2xx 但內容不是 JSON」
+    /// (快取層/代理塞回錯誤頁的情況),不拿非 JSON 去餵解析器——那會把「對方伺服器暫時掛掉」講成「解析失敗」。
+    /// </summary>
+    private static bool LooksLikeJson(string? value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return false;
+        }
+
+        foreach (var c in value)
+        {
+            if (char.IsWhiteSpace(c) || c == '\uFEFF')
+            {
+                continue;
+            }
+
+            return c == '{' || c == '[';
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 把回應內容截成一段能安全寫進 log 的短字串(單行、最多 120 字)。
+    /// 這是「三種失敗分得開」的關鍵:沒有它就只知道解析失敗,不知道對方到底回了什麼。
+    /// </summary>
+    private static string Snippet(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return "(空白回應)";
+        }
+
+        var trimmed = value.Trim().Replace('\r', ' ').Replace('\n', ' ');
+        return trimmed.Length > 120 ? trimmed.Substring(0, 120) + "..." : trimmed;
+    }
+
+    private static string DescribeStatus(HttpStatusCode? statusCode)
+    {
+        return statusCode == null ? "連線失敗或逾時" : $"HTTP {(int)statusCode.Value}";
+    }
+
+    private static async Task<string> SafeReadBodyAsync(HttpResponseMessage response, CancellationToken token)
+    {
+        try
+        {
+            return await response.Content.ReadAsStringAsync(token);
+        }
+        catch (Exception)
+        {
+            // 只是為了寫進 log 的診斷字串,讀不到就算了,不要因此把整批請求變成別的錯誤。
+            return string.Empty;
+        }
+    }
+
+    private static async Task<bool> DelaySafelyAsync(TimeSpan delay, CancellationToken token)
+    {
+        try
+        {
+            await Task.Delay(delay, token);
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
+
+        return !token.IsCancellationRequested;
+    }
 
 
     public async Task RetrieveMarketBoardPrices(IEnumerable<uint> itemIds, uint worldId, CancellationToken token,uint attempt = 0)
     {
-        if (token.IsCancellationRequested)
+        var itemIdList = itemIds.ToList();
+
+        if (itemIdList.Count == 0)
         {
             return;
         }
 
-        if (worldId == 0)
+        if (token.IsCancellationRequested)
         {
+            ReleaseQueued(itemIdList.Count);
             return;
         }
-        var itemIdList = itemIds.ToList();
-        if (attempt == MaxRetries)
+
+        // universalis 認不得的世界(以及 worldId 0)不送出請求。即使有人直接呼叫這個
+        // 公開方法繞過 QueuePriceCheck 也一樣。
+        if (!_universalisAvailability.IsWorldSupported(worldId))
         {
-            _queuedCount -= itemIdList.Count;
-            Logger.LogError($"Maximum retries for universalis has been reached, cancelling.");
+            ReleaseQueued(itemIdList.Count);
             return;
         }
+
+        // 這個世界剛剛連續失敗太多次,正在冷卻:直接丟掉,不送請求也不寫 log
+        // (寫了會變成另一種形式的洗版)。
+        if (_worldCooldownUntil.TryGetValue(worldId, out var cooldownUntil) && DateTime.Now < cooldownUntil)
+        {
+            ReleaseQueued(itemIdList.Count);
+            return;
+        }
+
+        if (attempt >= MaxRetries)
+        {
+            ReleaseQueued(itemIdList.Count);
+            Logger.LogError(
+                "universalis 查價已重試 {MaxRetries} 次仍未成功,放棄這批 {Count} 筆道具(世界 id {WorldId})。",
+                MaxRetries, itemIdList.Count, worldId);
+            return;
+        }
+
         string worldName;
         if (!_worldNames.ContainsKey(worldId))
         {
             var world = _worldSheet.GetRowOrDefault(worldId);
             if (world == null)
             {
-                _queuedCount -= itemIdList.Count;
+                ReleaseQueued(itemIdList.Count);
                 return;
             }
 
@@ -156,115 +629,363 @@ public class HostedUniversalis : BackgroundService, IUniversalis
         }
         worldName = _worldNames[worldId];
 
-        var itemIdsString = String.Join(",", itemIdList.Select(c => c.ToString()).ToArray());
-        Logger.LogTrace("Sending request for items {ItemIds} to universalis API.", itemIdsString);
-        string url =
-            $"https://universalis.app/api/v2/{worldName}/{itemIdsString}?listings=20&entries=20";
-        try
+        // 這個世界目前的批次上限。超過就先拆開再送——拆批不算重試次數,因為那不是
+        // 「同一個請求再試一次」,而是換成幾個比較小的請求。
+        var batchSize = GetBatchSize(worldId);
+        if (itemIdList.Count > batchSize)
         {
-            if (token.IsCancellationRequested)
+            foreach (var chunk in itemIdList.Chunk(batchSize))
             {
-                return;
+                await RetrieveMarketBoardPrices(chunk, worldId, token, attempt);
             }
 
+            return;
+        }
+
+        var itemIdsString = String.Join(",", itemIdList.Select(c => c.ToString()).ToArray());
+        Logger.LogTrace("Sending request for items {ItemIds} to universalis API.", itemIdsString);
+
+        // 🔴 entries=0 不能拿掉(拿掉就會回到大量 504),而且成本是二元的:對方只要被要求
+        //    附成交歷史就得去算,算的成本與要幾筆無關(entries=5 與 entries=20
+        //    一樣慢),而 listings 只影響回應大小、不影響耗時。
+        //    成交歷史改由 MergeRecentHistoryAsync 打專用端點取得。
+        string url =
+            $"https://universalis.app/api/v2/{worldName}/{itemIdsString}?listings=20&entries=0";
+        try
+        {
             var response = await HttpClient.GetAsync(url, token);
 
             if (response.StatusCode == HttpStatusCode.TooManyRequests)
             {
-                Logger.LogWarning("Too many requests to universalis, waiting a minute.");
+                // ② 被限流。這是暫時性的,而且對方明確告訴我們「慢一點」。
+                Logger.LogWarning(
+                    "universalis 回報請求過於頻繁(HTTP 429),等一分鐘後重試這批 {Count} 筆。若你同時開著多個會查市場的外掛,這是最常見的原因。",
+                    itemIdList.Count);
                 TooManyRequests = true;
-                await Task.Delay(TimeSpan.FromMinutes(1), token);
-                if (token.IsCancellationRequested)
+                LastFailure = DateTime.Now;
+                if (!await DelaySafelyAsync(TimeSpan.FromMinutes(1), token))
                 {
+                    ReleaseQueued(itemIdList.Count);
                     return;
                 }
+
                 await RetrieveMarketBoardPrices(itemIdList, worldId, token, attempt + 1);
                 return;
             }
 
             TooManyRequests = false;
 
-            var value = await response.Content.ReadAsStringAsync(token);
-
-            if (value == "error code: 504")
+            if (response.StatusCode == HttpStatusCode.NotFound)
             {
-                Logger.LogWarning("Gateway timeout to universalis, waiting 30 seconds.");
-                LastFailure = DateTime.Now;
-                await Task.Delay(TimeSpan.FromSeconds(30), token);
-                if (token.IsCancellationRequested)
+                // ① 這批道具沒有資料。universalis 對「這批道具它一個都不認得」也回 404
+                // (不可交易的道具就會這樣),世界本身不一定有問題,所以這裡不動世界的
+                // 可用性判定。這不是暫時性錯誤,重試不會變好,所以不進退避重試、也不印
+                // 紅字,每個世界只寫一次 Information。
+                if (_notFoundLoggedWorlds.TryAdd(worldId, default))
                 {
-                    return;
+                    Logger.LogInformation(
+                        "universalis 對世界「{WorldName}」(id {WorldId})的查價回了 404(通常是該批道具不可交易或它不認得),已跳過,不重試。",
+                        worldName, worldId);
                 }
-                await RetrieveMarketBoardPrices(itemIdList, worldId, token, attempt + 1);
+
+                ReleaseQueued(itemIdList.Count);
                 return;
             }
 
+            if (!response.IsSuccessStatusCode)
+            {
+                // 🔴 這一段不能省:除了 429 與 404 以外的任何狀態碼(500/502/504/
+                //    520/524/400/403…)沒攔下來就會被當成正常回應,內容直接餵進 JSON 解析器。
+                var errorBody = await SafeReadBodyAsync(response, token);
+                await HandleFailedRequestAsync(itemIdList, worldId, worldName, response.StatusCode, errorBody,
+                    url.Length, token, attempt);
+                return;
+            }
+
+            var value = await response.Content.ReadAsStringAsync(token);
+
+            if (!LooksLikeJson(value))
+            {
+                // 狀態碼是 2xx 但內容不是 JSON:一樣當成對方那側的暫時性問題,不要餵解析器。
+                await HandleFailedRequestAsync(itemIdList, worldId, worldName, response.StatusCode, value,
+                    url.Length, token, attempt);
+                return;
+            }
+
+            List<PricingAPIResponse> pricings;
             if (itemIdList.Count == 1)
             {
                 PricingAPIResponse? apiListing = JsonConvert.DeserializeObject<PricingAPIResponse>(value);
 
-                if (apiListing != null)
+                if (apiListing == null)
                 {
-                    var listing = MarketPricing.FromApi(apiListing, worldId,
-                        _hostedUniversalisConfiguration.SaleHistoryLimit);
-                    _ = _framework.RunOnFrameworkThread(() =>
-                        ItemPriceRetrieved?.Invoke(apiListing.itemID, worldId, listing));
+                    ReportUnexpectedShape(worldName, itemIdList.Count, value);
+                    ReleaseQueued(itemIdList.Count);
+                    return;
                 }
-                else
-                {
-                    Logger.LogError("Failed to parse universalis json data, backing off 30 seconds.");
-                    LastFailure = DateTime.Now;
-                    await Task.Delay(TimeSpan.FromSeconds(30), token);
-                    if (token.IsCancellationRequested)
-                    {
-                        return;
-                    }
-                }
+
+                pricings = new List<PricingAPIResponse> { apiListing };
             }
             else
             {
                 MultiRequest? multiRequest = JsonConvert.DeserializeObject<MultiRequest>(value);
-                if (multiRequest != null && multiRequest.items != null)
+                if (multiRequest?.items == null)
                 {
-                    foreach (var item in multiRequest.items.Select(c => c.Value))
-                    {
-                        var listing = MarketPricing.FromApi(item, worldId,
-                            _hostedUniversalisConfiguration.SaleHistoryLimit);
-                        _ = _framework.RunOnFrameworkThread(() =>
-                            ItemPriceRetrieved?.Invoke(item.itemID, worldId, listing));
-                    }
+                    ReportUnexpectedShape(worldName, itemIdList.Count, value);
+                    ReleaseQueued(itemIdList.Count);
+                    return;
                 }
-                else
-                {
-                    Logger.LogError("Failed to parse universalis multi request json data, backing off 30 seconds.");
-                    LastFailure = DateTime.Now;
-                    await Task.Delay(TimeSpan.FromSeconds(30), token);
-                    if (token.IsCancellationRequested)
-                    {
-                        return;
-                    }
-                }
-            }
-        }
-        catch (TaskCanceledException)
-        {
 
+                pricings = multiRequest.items.Select(c => c.Value).ToList();
+            }
+
+            // 成交歷史是第二個請求。拿不到不影響價格,所以刻意放在算 MarketPricing
+            // 之前、而且自己吞掉所有失敗。
+            await MergeRecentHistoryAsync(pricings, itemIdsString, itemIdList.Count, worldId, worldName,
+                token);
+
+            foreach (var item in pricings)
+            {
+                var listing = MarketPricing.FromApi(item, worldId,
+                    _hostedUniversalisConfiguration.SaleHistoryLimit);
+                _ = _framework.RunOnFrameworkThread(() =>
+                    ItemPriceRetrieved?.Invoke(item.itemID, worldId, listing));
+            }
+
+            ReportSuccess(worldId, worldName, itemIdList.Count);
+            ReleaseQueued(itemIdList.Count);
         }
-        catch (JsonReaderException readerException)
+        catch (OperationCanceledException ex)
         {
-            Logger.LogError(readerException, "Failed to parse universalis data, backing off 30 seconds");
-            LastFailure = DateTime.Now;
-            await Task.Delay(TimeSpan.FromSeconds(30), token);
             if (token.IsCancellationRequested)
             {
-                return;
+                // 外掛關閉/登出。不是錯誤。
+                ReleaseQueued(itemIdList.Count);
             }
+            else
+            {
+                // token 沒被取消的 TaskCanceledException(OperationCanceledException 的子類)
+                // 就是 HttpClient 自己的逾時。當成暫時性錯誤處理。
+                await HandleFailedRequestAsync(itemIdList, worldId, worldName, null, ex.Message, url.Length,
+                    token, attempt);
+            }
+        }
+        catch (HttpRequestException ex)
+        {
+            // 斷網、DNS、TLS、連線被中斷。
+            await HandleFailedRequestAsync(itemIdList, worldId, worldName, ex.StatusCode, ex.Message, url.Length,
+                token, attempt);
+        }
+        catch (JsonReaderException ex)
+        {
+            // 保險:LooksLikeJson 放行了但內容還是壞的。重試同一批只會拿到同一包壞資料,
+            // 所以這裡不退避也不重試,直接放掉。
+            Logger.LogError(ex,
+                "universalis 的回應以 JSON 開頭但解析失敗(世界「{WorldName}」,{Count} 筆),已跳過這批,不重試。",
+                worldName, itemIdList.Count);
+            LastFailure = DateTime.Now;
+            ReleaseQueued(itemIdList.Count);
         }
         catch (Exception ex)
         {
-            Logger.LogTrace(ex, "Unhandled exception in universalis");
+            Logger.LogError(ex,
+                "universalis 查價發生未預期的例外(世界「{WorldName}」,{Count} 筆)。",
+                worldName, itemIdList.Count);
+            LastFailure = DateTime.Now;
+            ReleaseQueued(itemIdList.Count);
         }
-        _queuedCount -= itemIdList.Count;
+    }
+
+    /// <summary>
+    /// 一次失敗的請求該怎麼處理。這裡是「三種失敗分得開」的分岔點:
+    ///   ② 暫時性(5xx / 408 / 連線失敗)→ 把批次調小再送;已經是最小批就指數退避重試。
+    ///   ③ 請求形狀不對(其餘 4xx)→ 寫一則帶狀態碼與回應內容的 Error,不重試。
+    /// (① 沒有資料 = 404,在呼叫端就先處理掉了,不會走到這裡。)
+    /// </summary>
+    private async Task HandleFailedRequestAsync(
+        List<uint> itemIdList,
+        uint worldId,
+        string worldName,
+        HttpStatusCode? statusCode,
+        string? body,
+        int urlLength,
+        CancellationToken token,
+        uint attempt)
+    {
+        LastFailure = DateTime.Now;
+        var statusText = DescribeStatus(statusCode);
+
+        if (!IsTransientStatus(statusCode))
+        {
+            // ③ 請求本身就不對。退避重試只會用同樣的錯誤形狀再撞一次,所以不重試,
+            //    改成把足以歸因的資訊一次寫齊(狀態碼、道具筆數、網址長度、回應內容)。
+            if (_badRequestLoggedWorlds.TryAdd((worldId, (int)statusCode!.Value), default))
+            {
+                Logger.LogError(
+                    "universalis 拒絕了查價請求,而且不是暫時性錯誤:世界「{WorldName}」(id {WorldId}),{StatusText},這批 {Count} 筆道具,網址長度 {UrlLength}。不重試。對方回應:{Body}",
+                    worldName, worldId, statusText, itemIdList.Count, urlLength, Snippet(body));
+            }
+
+            ReleaseQueued(itemIdList.Count);
+            return;
+        }
+
+        var streak = _worldFailureStreak.AddOrUpdate(worldId, 1, (_, previous) => previous + 1);
+
+        // 把這個世界的批次上限調小。實測「一次查太多筆」正是 504 的成因。
+        var previousBatch = GetBatchSize(worldId);
+        var reducedBatch = Math.Max(MinBatchSize, previousBatch / 2);
+        if (reducedBatch < previousBatch)
+        {
+            _worldBatchSize[worldId] = reducedBatch;
+            Logger.LogInformation(
+                "universalis 對世界「{WorldName}」的查價逾時({StatusText}):一次送太多筆會讓對方來不及回應,之後每批的上限由 {OldSize} 降到 {NewSize} 筆。",
+                worldName, statusText, previousBatch, reducedBatch);
+        }
+
+        // 第一次、以及每 10 次寫一則 Warning,中間的只寫 Debug ——
+        // 每一次都寫的話,對方掛掉期間 log 會連續洗版。
+        if (streak == 1 || streak % 10 == 0)
+        {
+            Logger.LogWarning(
+                "universalis 暫時回不了資料:世界「{WorldName}」,{StatusText},這批 {Count} 筆道具,連續第 {Streak} 次。這是對方伺服器端的暫時性問題,不是你的設定有問題。對方回應:{Body}",
+                worldName, statusText, itemIdList.Count, streak, Snippet(body));
+        }
+        else
+        {
+            Logger.LogDebug(
+                "universalis 暫時回不了資料:世界「{WorldName}」,{StatusText},這批 {Count} 筆道具,連續第 {Streak} 次。對方回應:{Body}",
+                worldName, statusText, itemIdList.Count, streak, Snippet(body));
+        }
+
+        // 連續失敗太多次:不再拆批也不再退避,整個世界安靜一段時間。
+        if (streak >= FailureStreakBeforeCooldown)
+        {
+            _worldCooldownUntil[worldId] = DateTime.Now + CooldownDuration;
+            Logger.LogWarning(
+                "universalis 對世界「{WorldName}」已經連續 {Streak} 次回不了資料,暫停對這個世界查價 {Minutes} 分鐘,以免一直重打。",
+                worldName, streak, (int)CooldownDuration.TotalMinutes);
+            ReleaseQueued(itemIdList.Count);
+            return;
+        }
+
+        // 拆批重試。只有真的會變小才拆,否則會原地打轉。
+        var splitSize = Math.Max(MinBatchSize, Math.Min(reducedBatch, (itemIdList.Count + 1) / 2));
+        if (splitSize < itemIdList.Count)
+        {
+            foreach (var chunk in itemIdList.Chunk(splitSize))
+            {
+                if (token.IsCancellationRequested)
+                {
+                    ReleaseQueued(chunk.Length);
+                    continue;
+                }
+
+                await RetrieveMarketBoardPrices(chunk, worldId, token, attempt + 1);
+            }
+
+            return;
+        }
+
+        // 已經是最小批了:指數退避(30 / 60 / 120 秒,不再往上)後重試同一批。
+        var backoffSeconds = 30 * (1 << (int)Math.Min(attempt, 2u));
+        if (!await DelaySafelyAsync(TimeSpan.FromSeconds(backoffSeconds), token))
+        {
+            ReleaseQueued(itemIdList.Count);
+            return;
+        }
+
+        await RetrieveMarketBoardPrices(itemIdList, worldId, token, attempt + 1);
+    }
+
+    private void ReportUnexpectedShape(string worldName, int count, string value)
+    {
+        Logger.LogError(
+            "universalis 回了一段合法 JSON,但欄位結構不是預期的形狀(世界「{WorldName}」,{Count} 筆),已跳過這批。對方回應:{Body}",
+            worldName, count, Snippet(value));
+        LastFailure = DateTime.Now;
+    }
+
+    /// <summary>
+    /// 查價成功。這裡刻意讓「成功」在 log 上也看得見——只有失敗會留下痕跡的話,
+    /// 使用者回報「查價壞了」時完全分不出「一直在失敗」與「根本沒送出請求」。
+    /// </summary>
+    private void ReportSuccess(uint worldId, string worldName, int count)
+    {
+        LastFailure = null;
+        _worldCooldownUntil.TryRemove(worldId, out _);
+
+        if (_worldFailureStreak.TryRemove(worldId, out var streak) && streak > 0)
+        {
+            Logger.LogInformation(
+                "universalis 對世界「{WorldName}」的查價已恢復正常(先前連續失敗 {Streak} 次),這次取回 {Count} 筆。",
+                worldName, streak, count);
+        }
+        else if (_successLoggedWorlds.TryAdd(worldId, default))
+        {
+            Logger.LogInformation(
+                "universalis 對世界「{WorldName}」(id {WorldId})的查價成功,這次取回 {Count} 筆,之後每批上限 {BatchSize} 筆。",
+                worldName, worldId, count, GetBatchSize(worldId));
+        }
+        else
+        {
+            TallySuccess(worldName, count);
+        }
+    }
+
+    private void TallySuccess(string worldName, int count)
+    {
+        var now = Environment.TickCount64;
+        string? summary = null;
+        lock (_successTallyLock)
+        {
+            if (_successTally.Count == 0)
+            {
+                _successTallyStartTicks = now;
+            }
+
+            _successTally.TryGetValue(worldName, out var tally);
+            _successTally[worldName] = (tally.Batches + 1, tally.Items + count);
+            if (now - _successTallyStartTicks >= (long)SuccessSummaryInterval.TotalMilliseconds)
+            {
+                summary = TakeSuccessSummary(now);
+            }
+        }
+
+        if (summary != null)
+        {
+            Logger.LogDebug("{Summary}", summary);
+        }
+    }
+
+    private void FlushSuccessTally()
+    {
+        string? summary;
+        lock (_successTallyLock)
+        {
+            summary = TakeSuccessSummary(Environment.TickCount64);
+        }
+
+        if (summary != null)
+        {
+            Logger.LogDebug("{Summary}", summary);
+        }
+    }
+
+    /// <summary>呼叫端持有 <see cref="_successTallyLock"/>。沒有累計時回 null。</summary>
+    private string? TakeSuccessSummary(long now)
+    {
+        if (_successTally.Count == 0)
+        {
+            return null;
+        }
+
+        var batches = _successTally.Values.Sum(t => t.Batches);
+        var items = _successTally.Values.Sum(t => t.Items);
+        var worlds = string.Join("、", _successTally.Select(kv => $"「{kv.Key}」{kv.Value.Batches} 批 {kv.Value.Items} 筆"));
+        var minutes = Math.Max(1, (int)Math.Round((now - _successTallyStartTicks) / 60000.0));
+        _successTally.Clear();
+        return $"universalis 查價成功彙總(約 {minutes} 分鐘內):共 {batches} 批 {items} 筆;{worlds}。";
     }
 
     protected virtual void Dispose(bool disposing)
@@ -281,4 +1002,15 @@ public class HostedUniversalis : BackgroundService, IUniversalis
         base.Dispose();
         GC.SuppressFinalize(this);
     }
+}
+
+/// <summary>
+/// universalis /api/v2/worlds 的一筆世界。欄位名刻意照 API 的小寫拼法,與這個資料夾裡
+/// 其他的 API 回應型別(PricingAPIResponse 等)一致。
+/// </summary>
+public class UniversalisWorld
+{
+    public uint id { get; set; }
+
+    public string? name { get; set; }
 }

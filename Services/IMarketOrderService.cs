@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using CriticalCommonLib.Models;
 
@@ -25,4 +26,15 @@ public interface IMarketOrderService
     /// <returns></returns>
     public IEnumerable<FFXIVClientStructs.FFXIV.Client.Game.InventoryItem> SortByBackupRetainerMarketOrder(
         IEnumerable<FFXIVClientStructs.FFXIV.Client.Game.InventoryItem> item);
+
+    /// <summary>
+    /// Sorts raw retainer market inventory while keeping empty slots at the end.
+    /// </summary>
+    public IEnumerable<FFXIVClientStructs.FFXIV.Client.Game.InventoryItem> SortByRetainerMarketOrder(
+        IEnumerable<FFXIVClientStructs.FFXIV.Client.Game.InventoryItem> item);
+
+    /// <summary>
+    /// 與 <see cref="SortByRetainerMarketOrder"/> 同一個順序（含同鍵保留原順序），直接排在傳入的格子上、不配置。
+    /// </summary>
+    public void SortByRetainerMarketOrderInPlace(Span<FFXIVClientStructs.FFXIV.Client.Game.InventoryItem> items);
 }

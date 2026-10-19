@@ -19,6 +19,11 @@ public class InventoryChange : ICsv, IItem
     public delegate InventoryChange FromGameItemFactory(InventoryItem? fromItem, InventoryItem? toItem, InventoryType inventoryType, bool firstLoad);
     public delegate InventoryChange FromProcessedChangeFactory(InventoryItem? fromItem, InventoryItem? toItem, InventoryChangeReason inventoryChangeReason, uint changeSetId);
 
+    public InventoryChange(InventoryItem.Factory inventoryItemFactory)
+    {
+        _inventoryItemFactory = inventoryItemFactory;
+    }
+
     public InventoryChange(InventoryItem.Factory inventoryItemFactory, InventoryItem? fromItem, InventoryItem? toItem, InventoryType inventoryType, bool firstLoad)
     {
         _inventoryItemFactory = inventoryItemFactory;
@@ -35,11 +40,6 @@ public class InventoryChange : ICsv, IItem
         InventoryChangeReason = inventoryChangeReason;
         ChangeDate = DateTime.Now;
         ChangeSetId = changeSetId;
-    }
-    
-    public InventoryChange(InventoryItem.Factory inventoryItemFactory)
-    {
-        _inventoryItemFactory = inventoryItemFactory;
     }
 
     public bool FirstLoad { get; private set; }
@@ -392,15 +392,21 @@ public class InventoryChange : ICsv, IItem
 
     public string[] ToCsv()
     {
-        string[] strings = new[]
-        {
-            FirstLoad ? "Y" : "N",
-            ((int)InventoryType).ToString(),
-            ((int)InventoryChangeReason).ToString(),
-            ChangeDate?.ToString(CultureInfo.InvariantCulture) ?? "",
-            ChangeSetId.ToString()
-        };
-        return strings.Concat(FromItem != null ? FromItem.ToCsv() : new []{"null"}).Concat(ToItem != null ? ToItem.ToCsv() : new []{"null"}).ToArray();
+        var fromItem = FromItem;
+        var toItem = ToItem;
+        var fromCount = fromItem != null ? InventoryItem.CsvFieldCount : 1;
+        var toCount = toItem != null ? InventoryItem.CsvFieldCount : 1;
+        var strings = new string[5 + fromCount + toCount];
+        strings[0] = FirstLoad ? "Y" : "N";
+        strings[1] = ((int)InventoryType).ToString();
+        strings[2] = ((int)InventoryChangeReason).ToString();
+        strings[3] = ChangeDate?.ToString(CultureInfo.InvariantCulture) ?? "";
+        strings[4] = ChangeSetId.ToString();
+        if (fromItem != null) fromItem.WriteCsvFields(strings, 5);
+        else strings[5] = "null";
+        if (toItem != null) toItem.WriteCsvFields(strings, 5 + fromCount);
+        else strings[5 + fromCount] = "null";
+        return strings;
     }
 
     public bool IncludeInCsv()

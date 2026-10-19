@@ -4,6 +4,7 @@ using AllaganLib.GameSheets.Service;
 using AllaganLib.GameSheets.Sheets;
 using AllaganLib.GameSheets.Sheets.Rows;
 using CriticalCommonLib.Agents;
+using FFXIVClientStructs.FFXIV.Client.Game.UI;
 using CriticalCommonLib.Services;
 using CriticalCommonLib.Services.Ui;
 using Dalamud.Plugin.Services;
@@ -18,17 +19,19 @@ namespace CriticalCommonLib.Crafting
         private IGameUiManager _gameUiManager;
         private readonly RecipeSheet _recipeSheet;
         private readonly IClientState _clientState;
+        private readonly IObjectTable _objectTable;
         private readonly IFramework _framework;
         private readonly IPluginLog _pluginLog;
         private readonly ClassJobService _classJobService;
         private readonly ExcelSheet<GathererCrafterLvAdjustTable> _adjustSheet;
         private readonly RecipeLevelTableSheet _recipeLevelTableSheet;
 
-        public CraftMonitor(IGameUiManager gameUiManager, RecipeSheet recipeSheet, IClientState clientState, IFramework framework, IPluginLog pluginLog, ClassJobService classJobService, ExcelSheet<GathererCrafterLvAdjustTable> adjustSheet, RecipeLevelTableSheet recipeLevelTableSheet)
+        public CraftMonitor(IGameUiManager gameUiManager, RecipeSheet recipeSheet, IClientState clientState, IObjectTable objectTable, IFramework framework, IPluginLog pluginLog, ClassJobService classJobService, ExcelSheet<GathererCrafterLvAdjustTable> adjustSheet, RecipeLevelTableSheet recipeLevelTableSheet)
         {
             this._gameUiManager = gameUiManager;
             this._recipeSheet = recipeSheet;
             _clientState = clientState;
+            _objectTable = objectTable;
             _framework = framework;
             _pluginLog = pluginLog;
             _classJobService = classJobService;
@@ -60,15 +63,15 @@ namespace CriticalCommonLib.Crafting
 
         private void FrameworkOnUpdate(IFramework framework)
         {
-            if (this.Agent != null && this.RecipeLevelTable != null && !this.Agent.IsTrialSynthesis)
+            if (this.Agent != null && this.RecipeLevelTable != null && this.Agent.Read() is { IsTrialSynthesis: false } values)
             {
-                if (this._progressMade != this.Agent.Progress)
+                if (this._progressMade != values.Progress)
                 {
-                    this._progressMade = (uint?) this.Agent.Progress;
+                    this._progressMade = (uint?) values.Progress;
                 }
-                if (this._currentItemId != this.Agent.ResultItemId)
+                if (this._currentItemId != values.ResultItemId)
                 {
-                    this._currentItemId = this.Agent.ResultItemId;
+                    this._currentItemId = values.ResultItemId;
                 }
 
                 if (this._progressRequired != this.RecipeLevelTable.ProgressRequired(this.CurrentRecipe))
@@ -97,11 +100,12 @@ namespace CriticalCommonLib.Crafting
             }
             if (this.SimpleAgent != null && this.RecipeLevelTable != null)
             {
-                var simpleAgentNqCompleted = Math.Max(0,this.SimpleAgent.NqCompleted);
-                var simpleAgentHqCompleted = Math.Max(0,this.SimpleAgent.HqCompleted);
-                var simpleAgentFailed = Math.Max(0,this.SimpleAgent.TotalFailed);
-                var itemId = this.SimpleAgent.ResultItemId;
-                var finished = this.SimpleAgent.Finished;
+                var simple = this.SimpleAgent.Read();
+                var simpleAgentNqCompleted = Math.Max(0,simple.NqCompleted);
+                var simpleAgentHqCompleted = Math.Max(0,simple.HqCompleted);
+                var simpleAgentFailed = Math.Max(0,simple.TotalFailed);
+                var itemId = simple.ResultItemId;
+                var finished = simple.Finished;
                 if (simpleAgentFailed >= 500)
                 {
                     return;
@@ -217,33 +221,36 @@ namespace CriticalCommonLib.Crafting
         private WindowName? _currentWindow;
 
 
-        public uint CraftType => (uint) (_clientState.LocalPlayer?.ClassJob.ValueNullable?.DohDolJobIndex ?? 0);
+        public uint CraftType => (uint) (_objectTable.LocalPlayer?.ClassJob.ValueNullable?.DohDolJobIndex ?? 0);
 
         public unsafe uint Recipe
         {
             get
             {
 
+                // 結果道具每次讀都要找一次視窗，先讀一次再比對整張配方表。
+                var resultItemId = Agent?.ResultItemId;
                 if (Agent != null && _recipeSheet
-                    .Count(c => c.Base.CraftType.RowId == CraftType && c.Base.ItemResult.RowId == Agent.ResultItemId) == 1)
+                    .Count(c => c.Base.CraftType.RowId == CraftType && c.Base.ItemResult.RowId == resultItemId) == 1)
                 {
                     return _recipeSheet
-                        .Single(c => c.Base.CraftType.RowId == CraftType && c.Base.ItemResult.RowId == Agent.ResultItemId).RowId;
+                        .Single(c => c.Base.CraftType.RowId == CraftType && c.Base.ItemResult.RowId == resultItemId).RowId;
                 }
 
                 if (Agent != null)
                 {
-                    var csRecipeNote = CSRecipeNote.Instance();
+                    var csRecipeNote = RecipeNote.Instance();
                     if (csRecipeNote != null && csRecipeNote->ActiveCraftRecipeId != 0)
                     {
                         return csRecipeNote->ActiveCraftRecipeId;
                     }
                 }
+                var simpleResultItemId = SimpleAgent?.ResultItemId;
                 if (SimpleAgent != null && _recipeSheet
-                    .Count(c => c.Base.CraftType.RowId == CraftType && c.Base.ItemResult.RowId == SimpleAgent.ResultItemId) == 1)
+                    .Count(c => c.Base.CraftType.RowId == CraftType && c.Base.ItemResult.RowId == simpleResultItemId) == 1)
                 {
                     return _recipeSheet
-                        .Single(c => c.Base.CraftType.RowId == CraftType && c.Base.ItemResult.RowId == SimpleAgent.ResultItemId).RowId;
+                        .Single(c => c.Base.CraftType.RowId == CraftType && c.Base.ItemResult.RowId == simpleResultItemId).RowId;
                 }
 
 
@@ -259,9 +266,11 @@ namespace CriticalCommonLib.Crafting
                 return;
             }
 
+            // 只存「怎麼找視窗」，不存視窗或 AtkValues 的位址：每次讀都重新找，製作中途視窗重建也不會讀到舊記憶體。
+            var windowName = this._currentWindow.Value.ToString();
             if (this._currentWindow == WindowName.Synthesis)
             {
-                this._agent = this._gameUiManager.GetWindowAsPtr(this._currentWindow.Value.ToString());
+                this._agent = new CraftingAgent(() => this._gameUiManager.GetWindowAsPtr(windowName));
                 var recipe = Recipe;
                 this._currentRecipe = this._recipeSheet.GetRowOrDefault(recipe);
                 if (this._currentRecipe != null)
@@ -288,7 +297,7 @@ namespace CriticalCommonLib.Crafting
             }
             else
             {
-                this._simpleCraftingAgent = this._gameUiManager.GetWindowAsPtr(this._currentWindow.Value.ToString());
+                this._simpleCraftingAgent = new SimpleCraftingAgent(() => this._gameUiManager.GetWindowAsPtr(windowName));
                 var recipe = Recipe;
 
                 this._currentRecipe = this._recipeSheet.GetRowOrDefault(recipe);

@@ -25,7 +25,16 @@ namespace CriticalCommonLib.Crafting
 
         public FFXIVClientStructs.FFXIV.Client.Game.InventoryItem.ItemFlags Flags;
 
-        [JsonIgnore] public ItemRow Item => ItemSheet.GetRow(this.ItemId)!;
+        // GetRowOrDefault, not GetRow: AllaganLib's ExtendedSheet.GetRow never returns null for a missing row. It
+        // fabricates an empty ItemRow and caches it, which only fails later when ItemRow.Base is read, and makes every
+        // later GetRowOrDefault for that id return non-null for the rest of the session (sheets are SingleInstance).
+        // Ids with no row on this client (saved lists, imported share codes) are pruned by
+        // CraftList.RemoveInvalidCraftItems, so this throw is a last line of defence that names the offending id.
+        [JsonIgnore]
+        public ItemRow Item =>
+            ItemSheet.GetRowOrDefault(this.ItemId) ??
+            throw new InvalidOperationException(
+                "CraftItem references item id " + this.ItemId + ", which has no row in this client's Item sheet.");
 
         [JsonIgnore] public string FormattedName => this.Phase != null && this.PhaseNames.Length != 1 ? this.Name + " - " + this.GetPhaseName(this.Phase.Value) : this.Name;
 
@@ -188,15 +197,24 @@ namespace CriticalCommonLib.Crafting
         {
             get
             {
-                if (this.Item.CanBeCrafted && this.RecipeId == 0)
+                // Deliberately not this.Item: that property throws for an id with no row, while every
+                // caller of Recipe already handles null. Resolving the item leniently here keeps Recipe
+                // total rather than turning a bad id into an exception on a draw path.
+                var itemRow = ItemSheet.GetRowOrDefault(this.ItemId);
+                if (itemRow != null && itemRow.CanBeCrafted && this.RecipeId == 0)
                 {
-                    var recipes = this.Item.Recipes;
+                    var recipes = itemRow.Recipes;
                     if (recipes.Count != 0)
                     {
                         this.RecipeId = recipes.First().RowId;
                     }
                 }
-                return this.RecipeId != 0 ? RecipeSheet.GetRow(this.RecipeId) : null;
+                // GetRowOrDefault for the same reason as CraftItem.Item above: RecipeId also round
+                // trips through the saved configuration, and GetRow would cache a fabricated RecipeRow
+                // that then breaks unrelated RecipeSheet.GetRowOrDefault callers for the whole session.
+                // The declared return type is already nullable and all call sites were audited to
+                // tolerate null, so this needs no changes at the other end.
+                return this.RecipeId != 0 ? RecipeSheet.GetRowOrDefault(this.RecipeId) : null;
             }
         }
 

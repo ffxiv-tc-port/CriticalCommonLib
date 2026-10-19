@@ -34,8 +34,23 @@ namespace CriticalCommonLib.Services.Ui
         {
             get
             {
-                var agent = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework
-                    .Instance()->UIModule->GetAgentModule()->GetAgentByInternalId(AgentId.ArmouryBoard);
+                // 不可以寫成 Framework.Instance()->UIModule->GetAgentModule()->GetAgentByInternalId(...)->IsAgentActive()：
+                // Framework.Instance() 是 [StaticAddress(isPointer: true)] 可能回 null，UIModule 是它的欄位也可能是 null，
+                // GetAgentModule() 是 [VirtualFunction(37)]、GetAgentByInternalId() 是 [MemberFunction]——null 的 this 是
+                // try/catch 攔不到的 AccessViolationException。用判空版 AgentModule.Instance() 並對 agent 指標判空；
+                // 取不到就沿用「代理人沒開著」的回傳值 -1。
+                var agentModule = AgentModule.Instance();
+                if (agentModule == null)
+                {
+                    return -1;
+                }
+
+                var agent = agentModule->GetAgentByInternalId(AgentId.ArmouryBoard);
+                if (agent == null)
+                {
+                    return -1;
+                }
+
                 if (agent->IsAgentActive())
                 {
                     var armouryAgent = (ArmouryBoard*) agent;

@@ -9,6 +9,7 @@ using System.Threading.Tasks;
 using AllaganLib.GameSheets.Sheets;
 using AllaganLib.Shared.Interfaces;
 using AllaganLib.Shared.Services;
+using CriticalCommonLib.Helpers;
 using CriticalCommonLib.Interfaces;
 using CriticalCommonLib.Services.Mediator;
 using DalaMock.Host.Mediator;
@@ -44,11 +45,20 @@ namespace CriticalCommonLib.MarketBoard
         private readonly Stopwatch _automaticSaveTimer = new();
         private readonly string? _cacheStorageLocation;
         private readonly BackgroundTaskQueue _saveQueue;
+        private readonly UniversalisAvailability _universalisAvailability;
 
         public int AutomaticSaveTime { get; set; } = 120;
 
-        public MarketCache(IUniversalis universalis, MediatorService? mediator, IDalamudPluginInterface pluginInterfaceService, MarketCacheConfiguration marketCacheConfiguration, BackgroundTaskQueue.Factory queueFactory, ExcelSheet<World> worldSheet, IPluginLog pluginLog, GameData gameData, ExcelSheet<Item> itemSheet)
+        /// <summary>
+        /// 目前是否還有任何世界查得到 universalis 資料。判定細節在 UniversalisAvailability:
+        /// 預設樂觀為 true,只有不在 universalis 世界清單裡的世界才會被排除。不按客戶端
+        /// 語言一刀切——universalis 收得到台服(繁中服)8 個世界的資料。
+        /// </summary>
+        public bool MarketDataAvailable => _universalisAvailability.MarketDataAvailable;
+
+        public MarketCache(IUniversalis universalis, MediatorService? mediator, IDalamudPluginInterface pluginInterfaceService, MarketCacheConfiguration marketCacheConfiguration, BackgroundTaskQueue.Factory queueFactory, ExcelSheet<World> worldSheet, IPluginLog pluginLog, GameData gameData, ExcelSheet<Item> itemSheet, UniversalisAvailability universalisAvailability)
         {
+            _universalisAvailability = universalisAvailability;
             _saveQueue = queueFactory.Invoke("Market Cache", 1);
             _universalis = universalis;
             _mediator = mediator;
@@ -65,7 +75,14 @@ namespace CriticalCommonLib.MarketBoard
         private bool _disposed;
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            await BackgroundProcessing(stoppingToken);
+            // 停用外掛或關閉遊戲時 stoppingToken 被取消是正常收工，刻意吞掉不記成錯誤。
+            try
+            {
+                await BackgroundProcessing(stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+            }
         }
 
         private async Task BackgroundProcessing(CancellationToken stoppingToken)
@@ -203,7 +220,11 @@ namespace CriticalCommonLib.MarketBoard
             {
                 try
                 {
-                    CsvLoader.ToCsvRaw(_marketBoardCache.Values.ToList(), _cacheStorageLocation);
+                    var error = CsvRowWriter.ToCsvRawAtomic(_marketBoardCache.Values.ToList(), _cacheStorageLocation);
+                    if (error != null)
+                    {
+                        _pluginLog.Debug(error, messageTemplate: "Failed to save MarketCache.");
+                    }
                 }
                 catch (Exception e)
                 {
@@ -240,7 +261,10 @@ namespace CriticalCommonLib.MarketBoard
         {
             if (_worldIds == null)
             {
-                _worldIds = _worldSheet.Where(c => c.IsPublic).Select(c => c.RowId).ToList();
+                // 台服(陸行鳥 DataCenter=151)現役 8 個世界(RowId 4028-4035)的官方 IsPublic
+                // 全部是 False。這個 overload 目前沒有呼叫點,但保留這個放行,
+                // 以免未來有人接上這個 overload 卻在台服拿到空的世界清單。
+                _worldIds = _worldSheet.Where(c => c.IsPublic || (c.RowId >= 4028 && c.RowId <= 4035)).Select(c => c.RowId).ToList();
             }
 
             return GetPricing(itemId, _worldIds, forceCheck);
@@ -262,6 +286,15 @@ namespace CriticalCommonLib.MarketBoard
             {
                 marketPricing = _marketBoardCache[(itemId, worldId)];
                 return MarketCachePricingResult.Successful;
+            }
+
+            //universalis 認不得這個世界(或還沒登入、worldId 為 0):已經存在的快取(上面那段)
+            //照樣給,但不再排任何新的查價。回傳 Disabled 而不是 NoPricing,是為了讓顯示端拿到
+            //null 而畫成「沒有資料」,不要畫成 0。
+            if (!_universalisAvailability.IsWorldSupported(worldId))
+            {
+                marketPricing = null;
+                return MarketCachePricingResult.Disabled;
             }
 
             //No pricing available
@@ -291,7 +324,9 @@ namespace CriticalCommonLib.MarketBoard
 
         public bool RequestCheck(uint itemId, uint worldId, bool forceCheck)
         {
-            if (worldId == 0)
+            //universalis 認不得這個世界(或還沒登入、worldId 為 0):沒有可查的線上資料來源,
+            //直接回報請求不成立。
+            if (!_universalisAvailability.IsWorldSupported(worldId))
             {
                 return false;
             }

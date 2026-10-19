@@ -151,8 +151,20 @@ namespace CriticalCommonLib.Services.Ui
         {
             get
             {
-                var agent = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework
-                    .Instance()->UIModule->GetAgentModule()->GetAgentMiragePrismPrismBox();
+                // 同 AtkArmouryBoard.CurrentTab：用判空版 AgentModule.Instance() 並對 agent 指標判空；
+                // 取不到就沿用「代理人沒開著」的回傳值 -1。
+                var agentModule = AgentModule.Instance();
+                if (agentModule == null)
+                {
+                    return -1;
+                }
+
+                var agent = agentModule->GetAgentMiragePrismPrismBox();
+                if (agent == null)
+                {
+                    return -1;
+                }
+
                 if (agent->IsAgentActive())
                 {
                     return agent->PageIndex;

@@ -22,21 +22,27 @@ public class OdrScanner : IOdrScanner, IDisposable
     private readonly IPluginLog _pluginLog;
     private readonly IGameInteropProvider _gameInteropProvider;
     private readonly IClientState _clientState;
+    private readonly ICharacterMonitor _characterMonitor;
     private bool _initialBootCheck;
     private Hook<UserFileManager.UserFileEvent.Delegates.WriteFile>? _writeFileHook;
     private Hook<UserFileManager.UserFileEvent.Delegates.ReadFile>? _readFileHook;
     private readonly Dictionary<ulong, InventorySortOrder> _sortOrders;
+    private InventorySortOrder? _lastSortOrder;
+
+    // 解析時暫放一個背包的格子；用 Exchange 借還，同時有第二個解析（卸載期 RunOnFrameworkThread 就地執行）時另配一份。
+    private (int slotIndex, int containerIndex)[]? _slotScratch;
 
     public delegate void SortOrderChangedDelegate(InventorySortOrder sortOrder);
     public event SortOrderChangedDelegate? OnSortOrderChanged;
 
     public OdrScanner(IFramework framework, IPluginLog pluginLog, IGameInteropProvider gameInteropProvider,
-        IClientState clientState)
+        IClientState clientState, ICharacterMonitor characterMonitor)
     {
         _framework = framework;
         _pluginLog = pluginLog;
         _gameInteropProvider = gameInteropProvider;
         _clientState = clientState;
+        _characterMonitor = characterMonitor;
         _sortOrders = new Dictionary<ulong, InventorySortOrder>();
     }
 
@@ -76,13 +82,22 @@ public class OdrScanner : IOdrScanner, IDisposable
         if (!_initialBootCheck && _clientState.IsLoggedIn)
         {
             _initialBootCheck = true;
-            _framework.RunOnTick(() =>
-            {
-                _pluginLog.Verbose("Marking ODR as modified so we can parse it.");
-                itemOrderModule->UserFileEvent.IsSavePending = true;
-            }, TimeSpan.FromSeconds(2));
+            QueueInitialOdrParse();
 
         }
+    }
+
+    // lambda 留在每幀都跑的 FrameworkOnUpdate 裡時，閉包物件在方法開頭每幀配置一個。
+    // 2 秒後才執行，所以模組指標在執行當下重取、判空（原生指標不跨幀保存）。
+    private unsafe void QueueInitialOdrParse()
+    {
+        _framework.RunOnTick(() =>
+        {
+            _pluginLog.Verbose("Marking ODR as modified so we can parse it.");
+            var itemOrderModule = ItemOrderModule.Instance();
+            if (itemOrderModule == null) return;
+            itemOrderModule->UserFileEvent.IsSavePending = true;
+        }, TimeSpan.FromSeconds(2));
     }
 
     private unsafe bool ReadFile(UserFileManager.UserFileEvent* thisPtr, bool decrypt, byte* ptr, ushort version, uint length)
@@ -103,8 +118,10 @@ public class OdrScanner : IOdrScanner, IDisposable
                     {
                         try
                         {
-                            var sortOrder = ParseItemOrder(buffer, true);
-                            _sortOrders[_clientState.LocalContentId] = sortOrder;
+                            var contentId = _characterMonitor.LocalContentId;
+                            var sortOrder = ParseItemOrder(buffer, PreviousSortOrder(contentId), true);
+                            _sortOrders[contentId] = sortOrder;
+                            _lastSortOrder = sortOrder;
                             OnSortOrderChanged?.Invoke(sortOrder);
                             _pluginLog.Verbose("Parsed the ODR from memory after a read.");
                         }
@@ -137,8 +154,10 @@ public class OdrScanner : IOdrScanner, IDisposable
                 {
                     try
                     {
-                        var sortOrder = ParseItemOrder(buffer);
-                        _sortOrders[_clientState.LocalContentId] = sortOrder;
+                        var contentId = _characterMonitor.LocalContentId;
+                        var sortOrder = ParseItemOrder(buffer, PreviousSortOrder(contentId));
+                        _sortOrders[contentId] = sortOrder;
+                        _lastSortOrder = sortOrder;
                         OnSortOrderChanged?.Invoke(sortOrder);
                         _pluginLog.Verbose("Parsed the ODR from memory after a write.");
                     }
@@ -157,7 +176,26 @@ public class OdrScanner : IOdrScanner, IDisposable
         return result;
     }
 
-    private InventorySortOrder ParseItemOrder(byte[] buffer, bool read = false)
+    private InventorySortOrder? PreviousSortOrder(ulong contentId) =>
+        _sortOrders.GetValueOrDefault(contentId) ?? _lastSortOrder;
+
+    // previous 裡同名背包／同 id 僱員的格子逐筆相同時沿用它的清單（RetainerSortOrder 整個沿用），否則配新的。
+    // 契約：交出去的清單沒有人改（InventoryScanner 只讀）。
+    private InventorySortOrder ParseItemOrder(byte[] buffer, InventorySortOrder? previous, bool read = false)
+    {
+        var scratch = Interlocked.Exchange(ref _slotScratch, null) ?? new (int slotIndex, int containerIndex)[256];
+        try
+        {
+            return ParseItemOrder(buffer, previous, read, ref scratch);
+        }
+        finally
+        {
+            Volatile.Write(ref _slotScratch, scratch);
+        }
+    }
+
+    private InventorySortOrder ParseItemOrder(byte[] buffer, InventorySortOrder? previous, bool read,
+        ref (int slotIndex, int containerIndex)[] scratch)
     {
         using (var reader = new MemoryStream(buffer))
         {
@@ -184,13 +222,15 @@ public class OdrScanner : IOdrScanner, IDisposable
                         case 110:
                         {
                             // Start of an inventory
-                            var inventory = ReadInventory(reader, read);
+                            var slotCount = ReadInventory(reader, read, ref scratch);
 
                             var i = inventoryIndex++;
                             if (i >= 0 && _inventoryNames.Length > i)
                             {
                                 var inventoryName = _inventoryNames[i];
-                                normalInventories.Add(inventoryName, inventory);
+                                List<(int slotIndex, int containerIndex)>? previousInventory = null;
+                                previous?.NormalInventories.TryGetValue(inventoryName, out previousInventory);
+                                normalInventories.Add(inventoryName, ReuseOrCopy(previousInventory, scratch, slotCount));
                             }
 
                             break;
@@ -198,7 +238,7 @@ public class OdrScanner : IOdrScanner, IDisposable
 
                         case 78:
                         {
-                            var retainers = ReadRetainer(reader, read);
+                            var retainers = ReadRetainer(reader, read, previous, ref scratch);
                             retainerInventories = retainers;
                             break;
                         }
@@ -241,25 +281,42 @@ public class OdrScanner : IOdrScanner, IDisposable
             read ? ReadUInt16(reader) : ReadUInt16(reader) ^ Xor16);
     }
 
-    private List<(int slotIndex, int containerIndex)> ReadInventory(MemoryStream reader, bool read)
+    // 格子寫進 scratch[0..回傳值)，不夠大就加倍。
+    private int ReadInventory(MemoryStream reader, bool read, ref (int slotIndex, int containerIndex)[] scratch)
     {
         var s = read ? ReadUInt8(reader) : ReadUInt8(reader) ^ Xor8;
         if (s != 4) UnexpectedSizeError(4, s);
         var slotCount = read ? ReadUInt32(reader) : ReadUInt32(reader) ^ Xor32;
 
-        var inventory = new List<(int slotIndex, int containerIndex)>();
+        var count = 0;
         for (var i = 0; i < slotCount; i++)
         {
             var x = read ? ReadUInt8(reader) : ReadUInt8(reader) ^ Xor8;
             if (x != 0x69) UnexpectedIdentifierError(0x69, x);
             var slot = ReadSlot(reader, read);
-            inventory.Add(slot);
+            if (count == scratch.Length) Array.Resize(ref scratch, scratch.Length * 2);
+            scratch[count++] = slot;
         }
 
+        return count;
+    }
+
+    private static List<(int slotIndex, int containerIndex)> ReuseOrCopy(
+        List<(int slotIndex, int containerIndex)>? previousInventory, (int slotIndex, int containerIndex)[] scratch, int count)
+    {
+        var slots = new ReadOnlySpan<(int slotIndex, int containerIndex)>(scratch, 0, count);
+        if (previousInventory != null && CollectionsMarshal.AsSpan(previousInventory).SequenceEqual(slots))
+        {
+            return previousInventory;
+        }
+
+        var inventory = new List<(int slotIndex, int containerIndex)>(count);
+        inventory.AddRange(slots);
         return inventory;
     }
 
-    private Dictionary<ulong, RetainerSortOrder> ReadRetainer(MemoryStream reader, bool read)
+    private Dictionary<ulong, RetainerSortOrder> ReadRetainer(MemoryStream reader, bool read, InventorySortOrder? previous,
+        ref (int slotIndex, int containerIndex)[] scratch)
     {
         var s = read ? ReadUInt8(reader) : ReadUInt8(reader) ^ Xor8;
         if (s != 4) UnexpectedSizeError(4, s);
@@ -270,37 +327,37 @@ public class OdrScanner : IOdrScanner, IDisposable
         {
             var x = read ? ReadUInt8(reader) : ReadUInt8(reader) ^ Xor8;
             if (x != 0x52) UnexpectedIdentifierError(0x52, x);
-            var retainer = ReadRetainerSlot(reader, read);
+            var retainer = ReadRetainerSlot(reader, read, previous, ref scratch);
             retainers.Add(retainer.Id, retainer);
         }
 
         return retainers;
     }
 
-    private RetainerSortOrder ReadRetainerSlot(MemoryStream reader, bool read)
+    private RetainerSortOrder ReadRetainerSlot(MemoryStream reader, bool read, InventorySortOrder? previous,
+        ref (int slotIndex, int containerIndex)[] scratch)
     {
         var s = read ? ReadUInt8(reader) : ReadUInt8(reader) ^ Xor8;
         if (s != 8) UnexpectedSizeError(8, s);
 
-        //I know this is terrible but I'm doing it anyway
-        var id = read ? ReadUInt8(reader) : ReadUInt8(reader) ^ Xor8;
-        var id2 = read ? ReadUInt8(reader) : ReadUInt8(reader) ^ Xor8;
-        var id3 = read ? ReadUInt8(reader) : ReadUInt8(reader) ^ Xor8;
-        var id4 = read ? ReadUInt8(reader) : ReadUInt8(reader) ^ Xor8;
-        var id5 = read ? ReadUInt8(reader) : ReadUInt8(reader) ^ Xor8;
-        var id6 = read ? ReadUInt8(reader) : ReadUInt8(reader) ^ Xor8;
-        var id7 = read ? ReadUInt8(reader) : ReadUInt8(reader) ^ Xor8;
-        var id8 = read ? ReadUInt8(reader) : ReadUInt8(reader) ^ Xor8;
-        var actualId = BitConverter.ToUInt64(new byte[]
+        // 8 個位元組依序是 id 的低位到高位（小端序）。
+        ulong actualId = 0;
+        for (var b = 0; b < 8; b++)
         {
-            (byte)id, (byte)id2, (byte)id3, (byte)id4, (byte)id5, (byte)id6, (byte)id7, (byte)id8
-        }, 0);
+            var idByte = (byte)(read ? ReadUInt8(reader) : ReadUInt8(reader) ^ Xor8);
+            actualId |= (ulong)idByte << (8 * b);
+        }
 
         var x = read ? ReadUInt8(reader) : ReadUInt8(reader) ^ Xor8;
         if (x != 0x6E) UnexpectedIdentifierError(0x6E, x);
-        var inventory = ReadInventory(reader, read);
-        var retainer = new RetainerSortOrder(actualId, inventory);
-        return retainer;
+        var slotCount = ReadInventory(reader, read, ref scratch);
+
+        RetainerSortOrder? previousRetainer = null;
+        previous?.RetainerInventories.TryGetValue(actualId, out previousRetainer);
+        var inventory = ReuseOrCopy(previousRetainer?.InventoryCoords, scratch, slotCount);
+        return previousRetainer != null && ReferenceEquals(inventory, previousRetainer.InventoryCoords)
+            ? previousRetainer
+            : new RetainerSortOrder(actualId, inventory);
     }
 
     private string[] _inventoryNames =
@@ -328,17 +385,15 @@ public class OdrScanner : IOdrScanner, IDisposable
         return (byte)reader.ReadByte();
     }
 
-    private ushort ReadUInt16(MemoryStream reader) //why? because why not?
+    // 小端序；C# 由左到右求值，先讀的是低位。
+    private ushort ReadUInt16(MemoryStream reader)
     {
-        return BitConverter.ToUInt16(new byte[] { (byte)reader.ReadByte(), (byte)reader.ReadByte() }, 0);
+        return (ushort)(ReadUInt8(reader) | ReadUInt8(reader) << 8);
     }
 
     private uint ReadUInt32(MemoryStream reader)
     {
-        return BitConverter.ToUInt32(new byte[]
-        {
-            (byte)reader.ReadByte(), (byte)reader.ReadByte(), (byte)reader.ReadByte(), (byte)reader.ReadByte()
-        }, 0);
+        return (uint)(ReadUInt8(reader) | ReadUInt8(reader) << 8 | ReadUInt8(reader) << 16 | ReadUInt8(reader) << 24);
     }
 
     private void Advance(MemoryStream reader, int amount)

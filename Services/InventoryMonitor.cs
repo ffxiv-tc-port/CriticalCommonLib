@@ -1,6 +1,9 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
+using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
 using CriticalCommonLib.Crafting;
 using CriticalCommonLib.Models;
@@ -22,6 +25,9 @@ namespace CriticalCommonLib.Services
         private Dictionary<ulong, Inventory> _inventories;
         private Dictionary<(uint, ItemFlags, ulong), int> _characterItemCounts = new();
         private Dictionary<(uint, ItemFlags), int> _itemCounts = new();
+        private int _modelVersion;
+        private Dictionary<(uint, ItemFlags, ulong), int>? _lastRoundCounts;
+        private int _lastRoundCountsVersion;
         private Dictionary<InventoryType, bool> _loadedInventories;
         private Queue<DateTime> _scheduledUpdates = new ();
         private Dictionary<uint, ItemMarketBoardInfo> _retainerMarketPrices = new();
@@ -102,6 +108,7 @@ namespace CriticalCommonLib.Services
             {
                 _inventoryScanner.ClearRetainerCache(characterId);
                 _inventories[characterId].ClearInventories();
+                InvalidateRoundCounts();
 
                 _frameworkService.RunOnFrameworkThread(() =>
                 {
@@ -124,7 +131,7 @@ namespace CriticalCommonLib.Services
                         _inventories[characterId] = _inventoryFactory.Invoke(character.CharacterType, characterId);
                     }
 
-                    _inventories[characterId].LoadItems(characterKvp.ToArray(), true);
+                    _inventories[characterId].LoadItemsWithoutChanges(characterKvp.ToArray());
                 }
                 else
                 {
@@ -132,6 +139,7 @@ namespace CriticalCommonLib.Services
                 }
             }
 
+            InvalidateRoundCounts();
             FillEmptySlots();
             GenerateAllItems();
             _frameworkService.RunOnFrameworkThread(() =>
@@ -161,40 +169,53 @@ namespace CriticalCommonLib.Services
             {
                 inventory.Value.FillSlots();
             }
+            InvalidateRoundCounts();
+        }
+
+        // 不經 GenerateInventoriesTask 改模型的路徑改完都要呼叫：上一輪結尾的計數就不再當下一輪的比對基準。
+        private void InvalidateRoundCounts()
+        {
+            Interlocked.Increment(ref _modelVersion);
         }
 
         public void GenerateItemCounts()
         {
-            var characterItemCounts = new Dictionary<(uint, ItemFlags, ulong), int>();
-            var itemCounts = new Dictionary<(uint, ItemFlags), int>();
-            foreach (var inventory in _inventories)
+            var characterItemCounts = CountCharacterItems();
+            // 由各角色的筆數加總而不是逐格再算一次：各鍵第一次出現的順序與總和都相同。
+            var itemCounts = new Dictionary<(uint, ItemFlags), int>(_itemCounts.Count);
+            foreach (var kv in characterItemCounts)
             {
-                foreach (var itemList in inventory.Value.GetAllInventories())
-                {
-                    foreach (var item in itemList)
-                    {
-                        if (item == null) continue;
-                        var key = (item.ItemId, item.Flags, item.RetainerId);
-                        if (!characterItemCounts.ContainsKey(key))
-                        {
-                            characterItemCounts[key] = 0;
-                        }
-
-                        characterItemCounts[key] += (int)item.Quantity;
-
-                        var key2 = (item.ItemId, item.Flags);
-                        if (!itemCounts.ContainsKey(key2))
-                        {
-                            itemCounts[key2] = 0;
-                        }
-
-                        itemCounts[key2] += (int)item.Quantity;
-
-                    }
-                }
+                CollectionsMarshal.GetValueRefOrAddDefault(itemCounts, (kv.Key.Item1, kv.Key.Item2), out _) += kv.Value;
             }
             _characterItemCounts = characterItemCounts;
             _itemCounts = itemCounts;
+        }
+
+        /// <summary>只重算並交出 <see cref="CharacterItemCounts"/>；<see cref="ItemCounts"/> 不動。</summary>
+        private void GenerateCharacterItemCounts()
+        {
+            _characterItemCounts = CountCharacterItems();
+        }
+
+        private Dictionary<(uint, ItemFlags, ulong), int> CountCharacterItems()
+        {
+            // 已交出去的字典消費端可能還拿著，永遠不再改 ⇒ 每次都 new；容量取上一份的筆數只為了省掉擴容。
+            var characterItemCounts = new Dictionary<(uint, ItemFlags, ulong), int>(_characterItemCounts.Count);
+            foreach (var inventory in _inventories)
+            {
+                // 與 GetAllInventories() 同樣的袋子、同樣的順序，只是不另建清單。
+                foreach (var inventoryType in Inventory.AllInventoryTypes)
+                {
+                    var itemList = inventory.Value.GetInventoryByType(inventoryType);
+                    if (itemList == null) continue;
+                    foreach (var item in itemList)
+                    {
+                        if (item == null) continue;
+                        CollectionsMarshal.GetValueRefOrAddDefault(characterItemCounts, (item.ItemId, item.Flags, item.RetainerId), out _) += (int)item.Quantity;
+                    }
+                }
+            }
+            return characterItemCounts;
         }
         private ItemChangesItem ConvertHashedItem((uint, ItemFlags, ulong) itemHash, int quantity)
         {
@@ -217,13 +238,13 @@ namespace CriticalCommonLib.Services
             foreach (var oldItem in oldItemCounts)
             {
                 // Check if the item is present in the newItems dictionary
-                if (newItemCounts.ContainsKey(oldItem.Key))
+                if (newItemCounts.TryGetValue(oldItem.Key, out var newCount))
                 {
                     // Check if the quantity has changed
-                    if (newItemCounts[oldItem.Key] != oldItem.Value)
+                    if (newCount != oldItem.Value)
                     {
                         // Add the item to the updatedItems dictionary
-                        var relativeCount = newItemCounts[oldItem.Key] - oldItem.Value;
+                        var relativeCount = newCount - oldItem.Value;
                         if (relativeCount > 0)
                         {
                             newItems.Add(oldItem.Key, relativeCount);
@@ -252,8 +273,8 @@ namespace CriticalCommonLib.Services
                 }
             }
 
-            List<ItemChangesItem> actualAddedItems = new();
-            List<ItemChangesItem> actualDeletedItems = new();
+            List<ItemChangesItem> actualAddedItems = new(newItems.Count);
+            List<ItemChangesItem> actualDeletedItems = new(removedItems.Count);
 
             foreach (var newItem in newItems)
             {
@@ -270,12 +291,15 @@ namespace CriticalCommonLib.Services
 
         private void GenerateAllItems()
         {
-            List<InventoryItem> newItems = new List<InventoryItem>();
+            // 舊清單交出去後不再改，同樣每次 new；容量取上一份的件數。
+            List<InventoryItem> newItems = new List<InventoryItem>(_allItems.TryGetNonEnumeratedCount(out var lastCount) ? lastCount : 0);
 
             foreach (var characterInventory in _inventories)
             {
-                foreach (var inventory in characterInventory.Value.GetAllInventories())
+                foreach (var inventoryType in Inventory.AllInventoryTypes)
                 {
+                    var inventory = characterInventory.Value.GetInventoryByType(inventoryType);
+                    if (inventory == null) continue;
                     foreach (var item in inventory)
                     {
                         if (item == null || item.ItemId == 0) continue;
@@ -295,13 +319,82 @@ namespace CriticalCommonLib.Services
             MonitorStarted,
         }
 
+        // 0＝閒置、1＝有一輪在排隊或在跑、2＝同上而且之後又有變動（這輪跑完要再補一輪）。
+        private int _generateState;
+
+        // 變動停了 QuietMs 才開始一輪；一直有變動時，從這批第一次變動起最多等 MaxDelayMs。
+        // 掃描端兩次觸發至少隔 500 ms，QuietMs 要比它長才併得起來。
+        private const int QuietMs = 650;
+        private const int MaxDelayMs = 750;
+        private long _lastChangeTimestamp;
+        private long _batchStartTimestamp;
+        private readonly CancellationTokenSource _disposeCts = new();
+
         private unsafe void GenerateInventories(InventoryGenerateReason generateReason)
         {
-            if (!_started)
+            if (!_started || Volatile.Read(ref _disposed))
             {
                 return;
             }
-            Task.Run(GenerateInventoriesTask);
+            var now = Stopwatch.GetTimestamp();
+            Volatile.Write(ref _lastChangeTimestamp, now);
+            // 同一時間最多一輪：只有從閒置轉出去的那次起工作，其餘只標記「要補一輪」。
+            while (true)
+            {
+                var state = Volatile.Read(ref _generateState);
+                if (state == 2) return;
+                if (Interlocked.CompareExchange(ref _generateState, state + 1, state) != state) continue;
+                if (state == 0)
+                {
+                    Volatile.Write(ref _batchStartTimestamp, now);
+                    Task.Run(GenerateInventoriesLoop);
+                }
+                return;
+            }
+        }
+
+        private async Task GenerateInventoriesLoop()
+        {
+            while (true)
+            {
+                try
+                {
+                    await WaitForQuiet().ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                }
+                // 等完才收掉「要補一輪」：等待期間的變動併進這輪；之後才進來的變動一定會讓下面的 CAS 失敗、再跑一輪。
+                Interlocked.Exchange(ref _generateState, 1);
+                if (Volatile.Read(ref _disposed))
+                {
+                    Volatile.Write(ref _generateState, 0);
+                    return;
+                }
+                try
+                {
+                    GenerateInventoriesTask();
+                }
+                catch (Exception e)
+                {
+                    _pluginLog.Error(e, "Generating inventories failed.");
+                }
+                if (Interlocked.CompareExchange(ref _generateState, 0, 1) == 1) return;
+                // 補跑那批的變動都在剛才那輪期間進來，從這一刻起算上限。
+                Volatile.Write(ref _batchStartTimestamp, Stopwatch.GetTimestamp());
+            }
+        }
+
+        private async Task WaitForQuiet()
+        {
+            var deadline = Volatile.Read(ref _batchStartTimestamp) + MaxDelayMs * Stopwatch.Frequency / 1000;
+            while (!Volatile.Read(ref _disposed))
+            {
+                var due = Math.Min(Volatile.Read(ref _lastChangeTimestamp) + QuietMs * Stopwatch.Frequency / 1000, deadline);
+                var remaining = due - Stopwatch.GetTimestamp();
+                if (remaining <= 0) return;
+                await Task.Delay((int)(remaining * 1000 / Stopwatch.Frequency) + 1, _disposeCts.Token).ConfigureAwait(false);
+            }
         }
 
         private void GenerateInventoriesTask()
@@ -314,8 +407,20 @@ namespace CriticalCommonLib.Services
             }
 
 
-            GenerateItemCounts();
-            var oldItemCounts = _characterItemCounts;
+            // 開頭只需要改動前的各角色筆數當比對基準；兩輪之間沒有別人改過模型就沿用上一輪結尾那份。
+            // 先取走再算：這輪中途擲例外時模型可能已改一半，下一輪不得沿用。
+            var lastCounts = _lastRoundCounts;
+            _lastRoundCounts = null;
+            Dictionary<(uint, ItemFlags, ulong), int> oldItemCounts;
+            if (lastCounts != null && _lastRoundCountsVersion == Volatile.Read(ref _modelVersion))
+            {
+                oldItemCounts = lastCounts;
+            }
+            else
+            {
+                GenerateCharacterItemCounts();
+                oldItemCounts = _characterItemCounts;
+            }
 
             if (!_inventories.ContainsKey(characterId))
             {
@@ -337,10 +442,15 @@ namespace CriticalCommonLib.Services
             GenerateCurrencyInventories(inventory, inventoryChanges);
             GenerateCrystalInventories(inventory, inventoryChanges);
 
+            // 版本要在計數「之前」讀：計數途中有人改模型，版本就對不上、下一輪重算。
+            var version = Volatile.Read(ref _modelVersion);
             GenerateItemCounts();
             var newItemCounts = _characterItemCounts;
+            _lastRoundCountsVersion = version;
+            _lastRoundCounts = newItemCounts;
             var itemChanges = CompareItemCounts(oldItemCounts, newItemCounts);
             GenerateAllItems();
+            if (Volatile.Read(ref _disposed)) return;
             _frameworkService.RunOnFrameworkThread(() =>
             {
                 OnInventoryChanged?.Invoke(inventoryChanges, itemChanges);
@@ -409,7 +519,7 @@ namespace CriticalCommonLib.Services
                 }
             }
 
-            var gearSets = _inventoryScanner.GetGearSets();
+            var gearSets = _inventoryScanner.GetGearSetMembership();
             foreach (var inventoryType in inventoryTypes)
             {
                 if (!_inventoryScanner.InMemory.Contains(inventoryType))
@@ -418,23 +528,22 @@ namespace CriticalCommonLib.Services
                 }
                 var armoryItems = _inventoryScanner.GetInventoryByType(inventoryType);
                 inventory.LoadGameItems(armoryItems, inventoryType.Convert(), InventoryCategory.CharacterArmoryChest, false, inventoryChanges,
-                    (newItem,_) =>
-                {
-                    if(gearSets.ContainsKey(newItem.ItemId))
-                    {
-                        newItem.GearSets = gearSets[newItem.ItemId].Select(c => (uint)c.Item1).ToArray();
-                        newItem.GearSetNames = gearSets[newItem.ItemId].Select(c => c.Item2).ToArray();
-                    }
-                    else if(gearSets.ContainsKey(newItem.ItemId + 1_000_000))
-                    {
-                        newItem.GearSets = gearSets[newItem.ItemId + 1_000_000].Select(c => (uint)c.Item1).ToArray();
-                        newItem.GearSetNames = gearSets[newItem.ItemId + 1_000_000].Select(c => c.Item2).ToArray();
-                    }
-                    else
-                    {
-                        newItem.GearSets = new uint[]{};
-                    }
-                });
+                    (newItem,_) => ApplyGearSets(gearSets, newItem));
+            }
+        }
+
+        // 同一個 ID 的格子共用同一組陣列（GearSetMembership 的契約：不可原地修改）。
+        private static void ApplyGearSets(GearSetMembership gearSets, InventoryItem newItem)
+        {
+            if (gearSets.TryGet(newItem.ItemId, out var gearSetIds, out var gearSetNames) ||
+                gearSets.TryGet(newItem.ItemId + 1_000_000, out gearSetIds, out gearSetNames))
+            {
+                newItem.GearSets = gearSetIds;
+                newItem.GearSetNames = gearSetNames;
+            }
+            else
+            {
+                newItem.GearSets = Array.Empty<uint>();
             }
         }
 
@@ -443,25 +552,9 @@ namespace CriticalCommonLib.Services
             if (_inventoryScanner.InMemory.Contains(FFXIVClientStructs.FFXIV.Client.Game.InventoryType.EquippedItems))
             {
                 var bag1 = _inventoryScanner.CharacterEquipped;
-                var gearSets = _inventoryScanner.GetGearSets();
+                var gearSets = _inventoryScanner.GetGearSetMembership();
                 inventory.LoadGameItems(bag1, InventoryType.GearSet0, InventoryCategory.CharacterEquipped, false, inventoryChanges,
-                    (newItem,_) =>
-                    {
-                        if(gearSets.ContainsKey(newItem.ItemId))
-                        {
-                            newItem.GearSets = gearSets[newItem.ItemId].Select(c => (uint)c.Item1).ToArray();
-                            newItem.GearSetNames = gearSets[newItem.ItemId].Select(c => c.Item2).ToArray();
-                        }
-                        else if(gearSets.ContainsKey(newItem.ItemId + 1_000_000))
-                        {
-                            newItem.GearSets = gearSets[newItem.ItemId + 1_000_000].Select(c => (uint)c.Item1).ToArray();
-                            newItem.GearSetNames = gearSets[newItem.ItemId + 1_000_000].Select(c => c.Item2).ToArray();
-                        }
-                        else
-                        {
-                            newItem.GearSets = new uint[]{};
-                        }
-                    });
+                    (newItem,_) => ApplyGearSets(gearSets, newItem));
             }
         }
 
@@ -626,7 +719,7 @@ namespace CriticalCommonLib.Services
                 }
 
                 var inventory = _inventories[currentRetainer];
-                _pluginLog.Debug("Retainer inventory found in scanner, loading into inventory monitor.");
+                _pluginLog.Verbose("Retainer inventory found in scanner, loading into inventory monitor.");
                 foreach (var inventoryType in inventoryTypes)
                 {
                     var items = _inventoryScanner.GetInventoryByType(currentRetainer,inventoryType);
@@ -741,23 +834,12 @@ namespace CriticalCommonLib.Services
         {
             if(!_disposed && disposing)
             {
-                _characterMonitor.OnCharacterRemoved -= CharacterMonitorOnOnCharacterRemoved;
+                if (_inventoryScanner != null) _inventoryScanner.BagsChanged -= InventoryScannerOnBagsChanged;
+                if (_characterMonitor != null) _characterMonitor.OnCharacterRemoved -= CharacterMonitorOnOnCharacterRemoved;
             }
-            _disposed = true;
-        }
-
-        ~InventoryMonitor()
-        {
-#if DEBUG
-            // In debug-builds, make sure that a warning is displayed when the Disposable object hasn't been
-            // disposed by the programmer.
-
-            if( _disposed == false )
-            {
-                _pluginLog.Error("There is a disposable object which hasn't been disposed before the finalizer call: " + (this.GetType ().Name));
-            }
-#endif
-            Dispose (true);
+            // 正在跑的那一輪不等它：跑完不再送事件、也不再補跑（見 GenerateInventoriesLoop）。
+            Volatile.Write(ref _disposed, true);
+            _disposeCts.Cancel();
         }
 
         public class ItemChanges

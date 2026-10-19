@@ -4,9 +4,9 @@ namespace CriticalCommonLib.Extensions
 {
     public static class ClientStateExtension
     {
-        public static string GetCharacterName(this IClientState clientState)
+        public static string GetCharacterName(this IObjectTable objectTable)
         {
-            return clientState.LocalPlayer != null ? clientState.LocalPlayer.Name.ToString() : "";
+            return objectTable.LocalPlayer != null ? objectTable.LocalPlayer.Name.ToString() : "";
         }
     }
 }

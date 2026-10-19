@@ -1,5 +1,5 @@
 using System;
-using CriticalCommonLib.EventHandlers;
+using FFXIVClientStructs.FFXIV.Client.Game.Event;
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
 using Lumina.Excel;
 using Lumina.Excel.Sheets;
@@ -65,7 +65,8 @@ public class ClassJobService
     {
         var jobLevel = (ushort)this.GetPlayerLevel(me);
 
-        var handler = CSCraftEventHandler.Instance();
+        var eventFramework = EventFramework.Instance();
+        var handler = eventFramework != null ? eventFramework->GetCraftEventHandler() : null;
 
         if (handler != null)
         {

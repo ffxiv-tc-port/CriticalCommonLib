@@ -33,10 +33,10 @@ namespace CriticalCommonLib.Services.Ui
         {
             get
             {
-                var addon = AtkUnitBase;
-                if (addon != null && addon.AtkUnitBase != null)
+                var addon = AddonPointer;
+                if (addon != null)
                 {
-                    var largeAddon = (InventoryGridAddon*) addon.AtkUnitBase;
+                    var largeAddon = (InventoryGridAddon*) addon;
                     return largeAddon->CurrentTab;
                 }
                 return -1;

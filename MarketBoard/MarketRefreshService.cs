@@ -26,15 +26,22 @@ public class MarketRefreshService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        while (!stoppingToken.IsCancellationRequested)
+        // 停用外掛或關閉遊戲時 stoppingToken 被取消是正常收工，刻意吞掉不記成錯誤。
+        try
         {
-            _pluginLog.Verbose($"Market refresh service waiting for {RefreshInterval} seconds.");
-            await Task.Delay(TimeSpan.FromSeconds(RefreshInterval), stoppingToken);
-            var queuedItems = ProcessOldPrices(stoppingToken);
-            if (queuedItems != 0)
+            while (!stoppingToken.IsCancellationRequested)
             {
-                _pluginLog.Verbose($"Market refresh service has queued {queuedItems} items.");
+                _pluginLog.Verbose($"Market refresh service waiting for {RefreshInterval} seconds.");
+                await Task.Delay(TimeSpan.FromSeconds(RefreshInterval), stoppingToken);
+                var queuedItems = ProcessOldPrices(stoppingToken);
+                if (queuedItems != 0)
+                {
+                    _pluginLog.Verbose($"Market refresh service has queued {queuedItems} items.");
+                }
             }
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
         }
     }
 

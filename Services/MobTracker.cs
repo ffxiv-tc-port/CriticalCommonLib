@@ -209,24 +209,10 @@ namespace CriticalCommonLib.Services
         {
             if(!_disposed && disposing)
             {
-                _pluginLog.Verbose("Disposing {type} ({this})", GetType().Name, this);
+                _pluginLog?.Verbose("Disposing {type} ({this})", GetType().Name, this);
                 _npcSpawnHook?.Dispose();
             }
             _disposed = true;
-        }
-
-        ~MobTracker()
-        {
-#if DEBUG
-            // In debug-builds, make sure that a warning is displayed when the Disposable object hasn't been
-            // disposed by the programmer.
-
-            if( _disposed == false )
-            {
-                _pluginLog.Error("There is a disposable object which hasn't been disposed before the finalizer call: " + (this.GetType ().Name));
-            }
-#endif
-            Dispose (true);
         }
     }
 }
