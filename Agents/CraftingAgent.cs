@@ -7,7 +7,8 @@ namespace CriticalCommonLib.Agents
     //Not really an agent but seems a good as spot as any
     /// <summary>
     /// Reads the Synthesis window's AtkValues. Holds no native pointer between frames: every read resolves the window
-    /// again and only reads a slot that is inside AtkValuesCount (window gone or array too short reads 0, like a null agent did).
+    /// again. <see cref="Read"/> returns null when the window is gone or its array is too short for every slot read here;
+    /// the single-value properties read 0 in that case, like a null agent did.
     /// </summary>
     public unsafe class CraftingAgent
     {
@@ -39,13 +40,19 @@ namespace CriticalCommonLib.Agents
             }
         }
 
-        /// <summary>All values from one lookup of the window; read once per frame instead of property by property.</summary>
-        public Values Read()
+        // Highest slot Read() touches is OffsetResultItemId (slot 16).
+        private const int RequiredCount = OffsetResultItemId / 16 + 1;
+
+        /// <summary>
+        /// All values from one lookup of the window; read once per frame instead of property by property.
+        /// Null＝nothing trustworthy this frame (window gone, no AtkValues, or fewer than the slots read here): callers skip the frame.
+        /// </summary>
+        public Values? Read()
         {
             var addon = (AtkUnitBase*)_addonResolver();
-            if (addon == null || addon->AtkValues == null)
+            if (addon == null || addon->AtkValues == null || addon->AtkValuesCount < RequiredCount)
             {
-                return default;
+                return null;
             }
 
             var values = (byte*)addon->AtkValues;
@@ -73,20 +80,20 @@ namespace CriticalCommonLib.Agents
 
         public readonly record struct Values(int Step, CraftStatus Status, bool IsTrialSynthesis, int Durability, int HqChance, int Quality, int Progress, uint ResultItemId);
 
-        public int Step => Read().Step;
+        public int Step => Read()?.Step ?? 0;
 
-        public CraftStatus Status => Read().Status;
+        public CraftStatus Status => Read()?.Status ?? default;
 
-        public bool IsTrialSynthesis => Read().IsTrialSynthesis;
+        public bool IsTrialSynthesis => Read()?.IsTrialSynthesis ?? false;
 
-        public int Durability => Read().Durability;
+        public int Durability => Read()?.Durability ?? 0;
 
-        public int HqChance => Read().HqChance;
+        public int HqChance => Read()?.HqChance ?? 0;
 
-        public int Quality => Read().Quality;
+        public int Quality => Read()?.Quality ?? 0;
 
-        public int Progress => Read().Progress;
+        public int Progress => Read()?.Progress ?? 0;
 
-        public uint ResultItemId => Read().ResultItemId;
+        public uint ResultItemId => Read()?.ResultItemId ?? 0;
     }
 }

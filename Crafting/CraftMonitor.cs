@@ -98,9 +98,9 @@ namespace CriticalCommonLib.Crafting
                     this._completed = true;
                 }
             }
-            if (this.SimpleAgent != null && this.RecipeLevelTable != null)
+            // Read() 為 null（視窗不在或格數不足）整幀跳過：當成 0 會被當真實進度，減掉記住的數量就下溢成天文數字。
+            if (this.SimpleAgent != null && this.RecipeLevelTable != null && this.SimpleAgent.Read() is { } simple)
             {
-                var simple = this.SimpleAgent.Read();
                 var simpleAgentNqCompleted = Math.Max(0,simple.NqCompleted);
                 var simpleAgentHqCompleted = Math.Max(0,simple.HqCompleted);
                 var simpleAgentFailed = Math.Max(0,simple.TotalFailed);

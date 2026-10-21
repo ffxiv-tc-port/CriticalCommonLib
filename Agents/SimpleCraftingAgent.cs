@@ -6,7 +6,7 @@ namespace CriticalCommonLib.Agents
     //Not really an agent but seems a good as spot as any
     /// <summary>
     /// Reads the SynthesisSimple (quick synthesis) window's AtkValues; same contract as <see cref="CraftingAgent"/>:
-    /// no native pointer kept between frames, slots outside AtkValuesCount read 0.
+    /// no native pointer kept between frames, <see cref="Read"/> is null when the window or any slot read here is missing.
     /// </summary>
     public unsafe class SimpleCraftingAgent
     {
@@ -35,13 +35,19 @@ namespace CriticalCommonLib.Agents
             }
         }
 
-        /// <summary>All values from one lookup of the window; read once per frame instead of property by property.</summary>
-        public Values Read()
+        // Highest slot Read() touches is OffsetHqTotal (slot 8).
+        private const int RequiredCount = OffsetHqTotal / 16 + 1;
+
+        /// <summary>
+        /// All values from one lookup of the window; null when the window is gone or too short.
+        /// Callers must skip the frame, not treat it as zeros: 0 completed against a remembered count underflows the uint delta.
+        /// </summary>
+        public Values? Read()
         {
             var addon = (AtkUnitBase*)_addonResolver();
-            if (addon == null || addon->AtkValues == null)
+            if (addon == null || addon->AtkValues == null || addon->AtkValuesCount < RequiredCount)
             {
-                return default;
+                return null;
             }
 
             var values = (byte*)addon->AtkValues;
@@ -61,18 +67,18 @@ namespace CriticalCommonLib.Agents
             public bool Finished => TotalCompleted == Total;
         }
 
-        public uint NqCompleted => Read().NqCompleted;
+        public uint NqCompleted => Read()?.NqCompleted ?? 0;
 
-        public uint HqCompleted => Read().HqCompleted;
+        public uint HqCompleted => Read()?.HqCompleted ?? 0;
 
-        public uint TotalCompleted => Read().TotalCompleted;
+        public uint TotalCompleted => Read()?.TotalCompleted ?? 0;
 
-        public uint TotalFailed => Read().TotalFailed;
+        public uint TotalFailed => Read()?.TotalFailed ?? 0;
 
-        public int Total => Read().Total;
+        public int Total => Read()?.Total ?? 0;
 
-        public bool Finished => Read().Finished;
+        public bool Finished => Read()?.Finished ?? true;
 
-        public uint ResultItemId => Read().ResultItemId;
+        public uint ResultItemId => Read()?.ResultItemId ?? 0;
     }
 }
