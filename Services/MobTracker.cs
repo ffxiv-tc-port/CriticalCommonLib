@@ -4,6 +4,7 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Numerics;
+using CriticalCommonLib.Helpers;
 using Dalamud.Hooking;
 using Dalamud.Plugin.Services;
 using Dalamud.Utility.Signatures;
@@ -32,7 +33,12 @@ namespace CriticalCommonLib.Services
             _clientState = clientState;
             _bNpcNameSheet = bNpcNameSheet;
             _territoryTypeSheet = territoryTypeSheet;
-            framework.RunOnFrameworkThread(() => { _gameInteropProvider.InitializeFromAttributes(this); });;
+            framework.RunOnFrameworkThread(() =>
+            {
+                var loadTimer = LoadTimer.Start();
+                _gameInteropProvider.InitializeFromAttributes(this);
+                _pluginLog.Information($"[LoadDiag] MobTracker 框架執行緒初始化（特徵碼＋hook）{loadTimer}");
+            });
         }
 
         private bool _enabled;

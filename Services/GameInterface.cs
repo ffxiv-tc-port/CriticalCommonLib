@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using AllaganLib.GameSheets.Sheets;
 using AllaganLib.GameSheets.Sheets.Rows;
+using CriticalCommonLib.Helpers;
 using CriticalCommonLib.Models;
 
 using Dalamud.Game.ClientState.Conditions;
@@ -43,7 +44,12 @@ namespace CriticalCommonLib.Services
             _itemSheet = itemSheet;
             _framework = framework;
             _pluginLog = pluginLog;
-            framework.RunOnFrameworkThread(() => { gameInteropProvider.InitializeFromAttributes(this); });
+            framework.RunOnFrameworkThread(() =>
+            {
+                var loadTimer = LoadTimer.Start();
+                gameInteropProvider.InitializeFromAttributes(this);
+                _pluginLog.Information($"[LoadDiag] GameInterface 框架執行緒初始化（特徵碼）{loadTimer}");
+            });
             ArmoireItems = cabinetSheet.Where(row => row.Base.Item.RowId != 0).ToDictionary(row => row.Base.Item.RowId, row => row);
         }
 

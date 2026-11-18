@@ -6,6 +6,7 @@ using AllaganLib.GameSheets.Sheets.Helpers;
 using CriticalCommonLib.Addons;
 using CriticalCommonLib.Extensions;
 using CriticalCommonLib.GameStructs;
+using CriticalCommonLib.Helpers;
 using CriticalCommonLib.Models;
 using CriticalCommonLib.Services.Ui;
 using Dalamud.Game.Addon.Lifecycle;
@@ -100,6 +101,7 @@ namespace CriticalCommonLib.Services
 
             _framework.RunOnFrameworkThread(() =>
             {
+                var loadTimer = LoadTimer.Start();
                 _gameInteropProvider.InitializeFromAttributes(this);
                 if (_containerInfoNetworkHook != null)
                 {
@@ -112,6 +114,7 @@ namespace CriticalCommonLib.Services
                 }
 
                 _containerInfoNetworkHook?.Enable();
+                _pluginLog.Information($"[LoadDiag] InventoryScanner 框架執行緒初始化（特徵碼＋hook）{loadTimer}");
             });
             framework.Update += FrameworkOnUpdate;
             _gameUiManager.UiVisibilityChanged += GameUiManagerOnUiManagerVisibilityChanged;

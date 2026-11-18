@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using CriticalCommonLib.Enums;
+using CriticalCommonLib.Helpers;
 using Dalamud.Game.Text.SeStringHandling;
 using Dalamud.Game.Text.SeStringHandling.Payloads;
 using Dalamud.Hooking;
@@ -130,9 +131,11 @@ namespace CriticalCommonLib.Services
             _logger = logger;
             framework.RunOnFrameworkThread(() =>
             {
+                var loadTimer = LoadTimer.Start();
                 gameInteropProvider.InitializeFromAttributes(this);
                 _generateItemTooltipHook?.Enable();
                 _itemHoveredHook?.Enable();
+                _logger.LogInformation("[LoadDiag] TooltipService 框架執行緒初始化（特徵碼＋hook）{Timing}", loadTimer.ToString());
             });
 
             _logger.LogDebug("Creating {type} ({this})", GetType().Name, this);

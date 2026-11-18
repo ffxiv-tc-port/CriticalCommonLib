@@ -68,7 +68,9 @@ namespace CriticalCommonLib.MarketBoard
             _gameData = gameData;
             _itemSheet = itemSheet;
             _cacheStorageLocation = Path.Join(pluginInterfaceService.ConfigDirectory.FullName, "market_cache.csv");
+            var loadTimer = LoadTimer.Start();
             LoadExistingCache();
+            LoadDiag.Record("市場價格快取", loadTimer);
             _universalis.ItemPriceRetrieved += UniversalisOnItemPriceRetrieved;
         }
 

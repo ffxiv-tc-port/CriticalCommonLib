@@ -4,6 +4,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using CriticalCommonLib.Helpers;
 using CriticalCommonLib.Models;
 using Dalamud.Hooking;
 using Dalamud.Plugin.Services;
@@ -63,20 +64,26 @@ public class OdrScanner : IOdrScanner, IDisposable
         var itemOrderModule = ItemOrderModule.Instance();
         if (itemOrderModule == null) return;
 
-        if (_readFileHook == null)
+        if (_readFileHook == null || _writeFileHook == null)
         {
-            _readFileHook = _gameInteropProvider.HookFromAddress<UserFileManager.UserFileEvent.Delegates.ReadFile>(
-                itemOrderModule->UserFileEvent.VirtualTable->ReadFile,
-                ReadFile);
-            _readFileHook.Enable();
-        }
+            var loadTimer = LoadTimer.Start();
+            if (_readFileHook == null)
+            {
+                _readFileHook = _gameInteropProvider.HookFromAddress<UserFileManager.UserFileEvent.Delegates.ReadFile>(
+                    itemOrderModule->UserFileEvent.VirtualTable->ReadFile,
+                    ReadFile);
+                _readFileHook.Enable();
+            }
 
-        if (_writeFileHook == null)
-        {
-            _writeFileHook = _gameInteropProvider.HookFromAddress<UserFileManager.UserFileEvent.Delegates.WriteFile>(
-                itemOrderModule->UserFileEvent.VirtualTable->WriteFile,
-                WriteFile);
-            _writeFileHook.Enable();
+            if (_writeFileHook == null)
+            {
+                _writeFileHook = _gameInteropProvider.HookFromAddress<UserFileManager.UserFileEvent.Delegates.WriteFile>(
+                    itemOrderModule->UserFileEvent.VirtualTable->WriteFile,
+                    WriteFile);
+                _writeFileHook.Enable();
+            }
+
+            _pluginLog.Information($"[LoadDiag] OdrScanner 框架執行緒建立背包排序 hook {loadTimer}");
         }
 
         if (!_initialBootCheck && _clientState.IsLoggedIn)
