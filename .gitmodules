@@ -1,0 +1,4 @@
+[submodule "AllaganLib"]
+	path = AllaganLib
+	url = https://github.com/ffxiv-tc-port/AllaganLib.git
+	branch = tc-7.30
