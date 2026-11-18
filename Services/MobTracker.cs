@@ -76,18 +76,27 @@ namespace CriticalCommonLib.Services
             }
         }
 
+        // 讀寫期間暫停 hook，結束後恢復呼叫前的狀態：開關只由設定同步決定，載入／匯出不會把關著的 hook 打開。
         public void SetEntries(List<MobSpawnPosition> spawnPositions)
         {
+            var wasEnabled = _enabled;
             Disable();
             positions = spawnPositions.GroupBy(c => c.TerritoryTypeId).ToDictionary(c => c.Key, c => c.GroupBy(d => d.BNpcNameId).ToDictionary(c => c.Key, c => c.ToList()));
-            Enable();
+            if (wasEnabled)
+            {
+                Enable();
+            }
         }
 
         public List<MobSpawnPosition> GetEntries()
         {
+            var wasEnabled = _enabled;
             Disable();
             var newPositions = positions.SelectMany(c => c.Value.SelectMany(d => d.Value.Select(e => e))).ToList();
-            Enable();
+            if (wasEnabled)
+            {
+                Enable();
+            }
             return newPositions;
         }
 
