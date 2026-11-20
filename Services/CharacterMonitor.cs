@@ -409,7 +409,7 @@ namespace CriticalCommonLib.Services
                         ushort sh2 = (ushort)character.HomeWorld.RowId;
                         ushort sh3 = (ushort)zoneId;
                         var houseId = ((ulong)sb1 << 56) | ((ulong)sb2 << 48) | ((ulong)sh1 << 32) | ((ulong)sh2 << 16) | sh3;
-                        var hasHousePermission = InternalHasHousePermission || GetOwnedHouseIds().Contains(houseId);
+                        var hasHousePermission = InternalHasHousePermission || OwnsHouse(houseId);
                         if (houseId != 0 && (hasHousePermission || _characters.ContainsKey(houseId)))
                         {
                             return houseId;
@@ -570,55 +570,64 @@ namespace CriticalCommonLib.Services
             return convertHouseId;
         }
 
+        // GetOwnedHouseIds 與 OwnsHouse 共用：順序與參數照原本逐一呼叫 GetOwnedHouseId 的寫法（沒給索引＝-1）。
+        private static readonly (EstateType Type, int SharedEstateIndex)[] OwnedEstateSlots =
+        {
+            (EstateType.FreeCompanyEstate, -1),
+            (EstateType.PersonalChambers, -1),
+            (EstateType.PersonalEstate, -1),
+            (EstateType.Unknown3, -1),
+            (EstateType.SharedEstate, 0),
+            (EstateType.SharedEstate, 1),
+            (EstateType.ApartmentBuilding, -1),
+            (EstateType.ApartmentRoom, -1),
+        };
+
         public unsafe List<ulong> GetOwnedHouseIds()
         {
             List<ulong> housingIds = new List<ulong>();
             var housingManager = HousingManager.Instance();
             if (housingManager != null)
             {
-                var id = HousingManager.GetOwnedHouseId(EstateType.FreeCompanyEstate).Id;
-                if (id != 0)
+                foreach (var (type, index) in OwnedEstateSlots)
                 {
-                    housingIds.Add(id);
-                }
-                id = HousingManager.GetOwnedHouseId(EstateType.PersonalChambers).Id;
-                if (id != 0)
-                {
-                    housingIds.Add(id);
-                }
-                id = HousingManager.GetOwnedHouseId(EstateType.PersonalEstate).Id;
-                if (id != 0)
-                {
-                    housingIds.Add(id);
-                }
-                id = HousingManager.GetOwnedHouseId(EstateType.Unknown3).Id;
-                if (id != 0)
-                {
-                    housingIds.Add(id);
-                }
-                id = HousingManager.GetOwnedHouseId(EstateType.SharedEstate, 0).Id;
-                if (id != 0)
-                {
-                    housingIds.Add(id);
-                }
-                id = HousingManager.GetOwnedHouseId(EstateType.SharedEstate, 1).Id;
-                if (id != 0)
-                {
-                    housingIds.Add(id);
-                }
-                id = HousingManager.GetOwnedHouseId(EstateType.ApartmentBuilding).Id;
-                if (id != 0)
-                {
-                    housingIds.Add(id);
-                }
-                id = HousingManager.GetOwnedHouseId(EstateType.ApartmentRoom).Id;
-                if (id != 0)
-                {
-                    housingIds.Add(id);
+                    var id = HousingManager.GetOwnedHouseId(type, index).Id;
+                    if (id != 0)
+                    {
+                        housingIds.Add(id);
+                    }
                 }
             }
 
             return housingIds.Select(ConvertHouseId).Where(c => c != 0).ToList();
+        }
+
+        /// <summary>與 <c>GetOwnedHouseIds().Contains(houseId)</c> 同答案、不配置（InternalHouseId 站在房屋區時每幀都問）。</summary>
+        /// <remarks>每個非 0 的房屋都照樣換算一次、不提早結束：ConvertHouseId 會寫快取，與原本走完整份清單相同。</remarks>
+        private unsafe bool OwnsHouse(ulong houseId)
+        {
+            if (HousingManager.Instance() == null)
+            {
+                return false;
+            }
+
+            var owned = false;
+            foreach (var (type, index) in OwnedEstateSlots)
+            {
+                var id = HousingManager.GetOwnedHouseId(type, index).Id;
+                if (id == 0)
+                {
+                    continue;
+                }
+
+                var converted = ConvertHouseId(id);
+                if (converted != 0 && converted == houseId)
+                {
+                    owned = true;
+                }
+            }
+
+            return owned;
         }
 
         public ulong InternalCharacterId => _objectTable.LocalPlayer != null ? _playerState.ContentId : 0;
