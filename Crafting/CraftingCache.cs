@@ -193,6 +193,12 @@ public class CraftingCache
                 preferences.Add(new IngredientPreference(itemId, ingredientPreferenceType, source.CostItem?.RowId,
                     gcShopSource.GCScripShopItem.Base.CostGCSeals));
             }
+            else if (source is ItemFccShopSource fccShopSource)
+            {
+                // 同上：Quantity 是獲得數量（固定 1），成本是公會點數價。
+                preferences.Add(new IngredientPreference(itemId, ingredientPreferenceType, source.CostItem?.RowId,
+                    fccShopSource.Cost));
+            }
             else
             {
                 preferences.Add(new IngredientPreference(itemId, ingredientPreferenceType, source.CostItem?.RowId,
