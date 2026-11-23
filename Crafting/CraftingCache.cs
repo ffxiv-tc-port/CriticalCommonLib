@@ -187,6 +187,12 @@ public class CraftingCache
                     preferences.Add(fateShopPreference);
                 }
             }
+            else if (source is ItemGCShopSource gcShopSource)
+            {
+                // Quantity 是獲得數量（固定 1），成本要取軍票價。
+                preferences.Add(new IngredientPreference(itemId, ingredientPreferenceType, source.CostItem?.RowId,
+                    gcShopSource.GCScripShopItem.Base.CostGCSeals));
+            }
             else
             {
                 preferences.Add(new IngredientPreference(itemId, ingredientPreferenceType, source.CostItem?.RowId,
