@@ -984,7 +984,8 @@ namespace CriticalCommonLib.Services
             var currency = InventoryManager.Instance()->GetInventoryContainer(InventoryType.Currency);
             if (_currencyItemIds == null)
             {
-                _currencyItemIds = _itemSheet.Where(c => c.RowId is >= 20 and <= 60 && c.Base.FilterGroup == 16 || c.Base.ItemUICategory.RowId == 100 || c.RowId == 1).Select(c => c.RowId).ToList();
+                _currencyItemIds = _itemSheet.Where(c => TrackedCurrencies.IsBaseCurrency(c) || c.RowId == 1).Select(c => c.RowId).ToList();
+                _currencyItemIds.AddRange(TrackedCurrencies.ExtraItemIds.Where(id => !_currencyItemIds.Contains(id) && _itemSheet.GetRowOrDefault(id) != null).ToList());
             }
 
             if (bag0 != null && bag1 != null && bag2 != null && bag3 != null && crystals != null && currency != null)
@@ -1120,6 +1121,12 @@ namespace CriticalCommonLib.Services
                     short slot = 0;
                     foreach (var currencyItemId in _currencyItemIds)
                     {
+                        // 槽位陣列是固定 100 格；貨幣種類超過時寧可少掃尾端，也不越界讓整輪掃描擲例外。
+                        if (slot >= CharacterCurrency.Length)
+                        {
+                            break;
+                        }
+
                         var itemCount = InventoryManager.Instance()->GetInventoryItemCount(currencyItemId, false, false, false);
                         if (itemCount != 0)
                         {
