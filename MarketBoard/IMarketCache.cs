@@ -22,6 +22,13 @@ namespace CriticalCommonLib.MarketBoard
         List<MarketPricing> GetPricing(uint itemId, List<uint> worldIds, bool forceCheck);
         List<MarketPricing> GetPricing(uint itemId, bool forceCheck);
 
+        /// <summary>
+        /// 背景定時更新專用：行為同 <c>GetPricing(itemId, worldId, ignoreCache: true, forceCheck: false, out _)</c>，
+        /// 只多把請求標成「背景更新」，供查價彙總分來源。
+        /// </summary>
+        MarketCachePricingResult QueueBackgroundRefresh(uint itemId, uint worldId) =>
+            GetPricing(itemId, worldId, true, false, out _);
+
         ConcurrentDictionary<(uint, uint), MarketPricing> CachedPricing { get; }
         /// <summary>
         ///

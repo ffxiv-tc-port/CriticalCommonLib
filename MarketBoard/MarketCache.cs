@@ -276,6 +276,16 @@ namespace CriticalCommonLib.MarketBoard
 
         public MarketCachePricingResult GetPricing(uint itemId, uint worldId, bool ignoreCache, bool forceCheck, out MarketPricing? marketPricing)
         {
+            return GetPricing(itemId, worldId, ignoreCache, forceCheck, false, out marketPricing);
+        }
+
+        public MarketCachePricingResult QueueBackgroundRefresh(uint itemId, uint worldId)
+        {
+            return GetPricing(itemId, worldId, true, false, true, out _);
+        }
+
+        private MarketCachePricingResult GetPricing(uint itemId, uint worldId, bool ignoreCache, bool forceCheck, bool backgroundRefresh, out MarketPricing? marketPricing)
+        {
             //Untradable
             if (_itemSheet.GetRowOrDefault(itemId)?.IsUntradable ?? true)
             {
@@ -312,7 +322,7 @@ namespace CriticalCommonLib.MarketBoard
             if (forceCheck || !_requestedItems.ContainsKey((itemId, worldId)))
             {
                 _requestedItems.TryAdd((itemId, worldId), default);
-                _universalis.QueuePriceCheck(itemId, worldId);
+                _universalis.QueuePriceCheck(itemId, worldId, backgroundRefresh);
                 return MarketCachePricingResult.Queued;
             }
 

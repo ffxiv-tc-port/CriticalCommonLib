@@ -11,6 +11,9 @@ namespace CriticalCommonLib.MarketBoard
         int QueuedCount { get; }
         void SetSaleHistoryLimit(int limit);
         void QueuePriceCheck(uint itemId, uint worldId);
+
+        /// <summary>同 <see cref="QueuePriceCheck(uint, uint)"/>；<paramref name="backgroundRefresh"/> 只影響查價彙總的來源分類。</summary>
+        void QueuePriceCheck(uint itemId, uint worldId, bool backgroundRefresh) => QueuePriceCheck(itemId, worldId);
         public DateTime? LastFailure { get; }
         public bool TooManyRequests { get; }
     }

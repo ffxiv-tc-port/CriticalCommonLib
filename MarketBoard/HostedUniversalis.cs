@@ -48,6 +48,20 @@ public class HostedUniversalis : BackgroundService, IUniversalis
     private long _successTallyStartTicks;
     private static readonly TimeSpan SuccessSummaryInterval = TimeSpan.FromMinutes(10);
 
+    /// <summary>彙總行的來源與批次分佈。同受 <see cref="_successTallyLock"/> 保護。</summary>
+    private int _tallyBackgroundItems;
+    private int _tallyInterfaceItems;
+    private int _tallyBackgroundBatches;
+    private int _tallyInterfaceBatches;
+    private int _tallyMixedBatches;
+    private readonly int[] _tallySizeBuckets = new int[4];
+
+    /// <summary>送出的 HTTP 請求數（含失敗），每次彙總時歸零。</summary>
+    private int _requestsSent;
+
+    /// <summary>由背景定時更新排入、還沒查成功的（道具, 世界）。只用於彙總分來源，不影響查價本身。</summary>
+    private readonly ConcurrentDictionary<(uint, uint), byte> _backgroundKeys = new();
+
     /// <summary>
     /// 每個世界目前連續失敗幾次。成功一次就清掉,清掉的時候寫一則「已恢復」。
     /// </summary>
@@ -56,10 +70,12 @@ public class HostedUniversalis : BackgroundService, IUniversalis
     /// <summary>
     /// 每個世界目前的批次上限。「一次查太多筆」會讓 universalis 的原站來不及回應,邊界(Cloudflare)直接回
     /// 504,所以遇到暫時性錯誤時把批次調小再送。⚠️ 最小批也不是零失敗,拆到最小之後仍然要有退避重試。
-    /// 預設值是 MaxBatchSize,只有實際失敗過的世界才會被調小,而且調小之後這個 session 內不再自動調回去
-    /// (避免在上限附近來回震盪、反覆吐警告);重載外掛就會回到預設值。
+    /// 預設值是 MaxBatchSize,只有實際失敗過的世界才會被調小;縮與回升的規則在 <see cref="UniversalisBatchSizing"/>。
     /// </summary>
     private readonly ConcurrentDictionary<uint, int> _worldBatchSize = new();
+
+    /// <summary>每個世界目前連續成功幾批；暫時性失敗歸零，批次上限回升時也歸零。</summary>
+    private readonly ConcurrentDictionary<uint, int> _worldSuccessStreak = new();
 
     /// <summary>
     /// 連續失敗太多次的世界,暫停到這個時間點為止。
@@ -83,13 +99,13 @@ public class HostedUniversalis : BackgroundService, IUniversalis
     /// <summary>
     /// 一次最多查幾筆。
     /// </summary>
-    private const int MaxBatchSize = 50;
+    private const int MaxBatchSize = UniversalisBatchSizing.MaxBatchSize;
 
     /// <summary>
     /// 批次調小的下限。實測台服世界在這個大小下失敗率約 5%(不是零),所以拆到這個
     /// 大小之後就不再往下拆,改成指數退避重試。
     /// </summary>
-    private const int MinBatchSize = 10;
+    private const int MinBatchSize = UniversalisBatchSizing.MinBatchSize;
 
     /// <summary>
     /// 目前是否還有任何世界查得到 universalis 資料。判定細節在 UniversalisAvailability:
@@ -276,11 +292,25 @@ public class HostedUniversalis : BackgroundService, IUniversalis
 
     public void QueuePriceCheck(uint itemId, uint worldId)
     {
+        QueuePriceCheck(itemId, worldId, false);
+    }
+
+    public void QueuePriceCheck(uint itemId, uint worldId, bool backgroundRefresh)
+    {
         // universalis 認不得的世界(以及還沒登入、拿不到世界時的 worldId 0)直接丟掉,
         // 不排程也不記錄(這個方法會被表格的每一列呼叫,記 log 會洗版)。
         if (!_universalisAvailability.IsWorldSupported(worldId))
         {
             return;
+        }
+
+        if (backgroundRefresh)
+        {
+            _backgroundKeys[(itemId, worldId)] = default;
+        }
+        else
+        {
+            _backgroundKeys.TryRemove((itemId, worldId), out _);
         }
         _queueWorldItemIds.TryAdd(worldId, (DateTime.Now.AddSeconds(QueueTime), []));
         _queueWorldItemIds[worldId].Item2.Add(itemId);
@@ -367,6 +397,7 @@ public class HostedUniversalis : BackgroundService, IUniversalis
 
         try
         {
+            Interlocked.Increment(ref _requestsSent);
             var response = await HttpClient.GetAsync(url, token);
             if (!response.IsSuccessStatusCode)
             {
@@ -653,6 +684,7 @@ public class HostedUniversalis : BackgroundService, IUniversalis
             $"https://universalis.app/api/v2/{worldName}/{itemIdsString}?listings=20&entries=0";
         try
         {
+            Interlocked.Increment(ref _requestsSent);
             var response = await HttpClient.GetAsync(url, token);
 
             if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -752,7 +784,7 @@ public class HostedUniversalis : BackgroundService, IUniversalis
                     ItemPriceRetrieved?.Invoke(item.itemID, worldId, listing));
             }
 
-            ReportSuccess(worldId, worldName, itemIdList.Count);
+            ReportSuccess(worldId, worldName, itemIdList);
             ReleaseQueued(itemIdList.Count);
         }
         catch (OperationCanceledException ex)
@@ -831,10 +863,11 @@ public class HostedUniversalis : BackgroundService, IUniversalis
         }
 
         var streak = _worldFailureStreak.AddOrUpdate(worldId, 1, (_, previous) => previous + 1);
+        _worldSuccessStreak.TryRemove(worldId, out _);
 
         // 把這個世界的批次上限調小。實測「一次查太多筆」正是 504 的成因。
         var previousBatch = GetBatchSize(worldId);
-        var reducedBatch = Math.Max(MinBatchSize, previousBatch / 2);
+        var reducedBatch = UniversalisBatchSizing.Shrink(previousBatch);
         if (reducedBatch < previousBatch)
         {
             _worldBatchSize[worldId] = reducedBatch;
@@ -910,10 +943,21 @@ public class HostedUniversalis : BackgroundService, IUniversalis
     /// 查價成功。這裡刻意讓「成功」在 log 上也看得見——只有失敗會留下痕跡的話,
     /// 使用者回報「查價壞了」時完全分不出「一直在失敗」與「根本沒送出請求」。
     /// </summary>
-    private void ReportSuccess(uint worldId, string worldName, int count)
+    private void ReportSuccess(uint worldId, string worldName, List<uint> itemIds)
     {
+        var count = itemIds.Count;
         LastFailure = null;
         _worldCooldownUntil.TryRemove(worldId, out _);
+        GrowBatchSizeAfterSuccess(worldId, worldName);
+
+        var backgroundItems = 0;
+        foreach (var itemId in itemIds)
+        {
+            if (_backgroundKeys.TryRemove((itemId, worldId), out _))
+            {
+                backgroundItems++;
+            }
+        }
 
         if (_worldFailureStreak.TryRemove(worldId, out var streak) && streak > 0)
         {
@@ -927,13 +971,40 @@ public class HostedUniversalis : BackgroundService, IUniversalis
                 "universalis 對世界「{WorldName}」(id {WorldId})的查價成功,這次取回 {Count} 筆,之後每批上限 {BatchSize} 筆。",
                 worldName, worldId, count, GetBatchSize(worldId));
         }
-        else
-        {
-            TallySuccess(worldName, count);
-        }
+
+        TallySuccess(worldName, count, backgroundItems);
     }
 
-    private void TallySuccess(string worldName, int count)
+    private void GrowBatchSizeAfterSuccess(uint worldId, string worldName)
+    {
+        if (!_worldBatchSize.TryGetValue(worldId, out var current))
+        {
+            return;
+        }
+
+        _worldSuccessStreak.TryGetValue(worldId, out var streak);
+        var (size, newStreak) = UniversalisBatchSizing.OnSuccess(current, streak);
+        _worldSuccessStreak[worldId] = newStreak;
+        if (size == current)
+        {
+            return;
+        }
+
+        if (size >= MaxBatchSize)
+        {
+            _worldBatchSize.TryRemove(worldId, out _);
+        }
+        else
+        {
+            _worldBatchSize[worldId] = size;
+        }
+
+        Logger.LogInformation(
+            "universalis 對世界「{WorldName}」已連續成功 {Streak} 批,每批上限由 {OldSize} 回升到 {NewSize} 筆。",
+            worldName, UniversalisBatchSizing.GrowAfterSuccesses, current, size);
+    }
+
+    private void TallySuccess(string worldName, int count, int backgroundItems)
     {
         var now = Environment.TickCount64;
         string? summary = null;
@@ -946,6 +1017,22 @@ public class HostedUniversalis : BackgroundService, IUniversalis
 
             _successTally.TryGetValue(worldName, out var tally);
             _successTally[worldName] = (tally.Batches + 1, tally.Items + count);
+            _tallyBackgroundItems += backgroundItems;
+            _tallyInterfaceItems += count - backgroundItems;
+            if (backgroundItems == count)
+            {
+                _tallyBackgroundBatches++;
+            }
+            else if (backgroundItems == 0)
+            {
+                _tallyInterfaceBatches++;
+            }
+            else
+            {
+                _tallyMixedBatches++;
+            }
+
+            _tallySizeBuckets[SizeBucket(count)]++;
             if (now - _successTallyStartTicks >= (long)SuccessSummaryInterval.TotalMilliseconds)
             {
                 summary = TakeSuccessSummary(now);
@@ -954,8 +1041,24 @@ public class HostedUniversalis : BackgroundService, IUniversalis
 
         if (summary != null)
         {
-            Logger.LogDebug("{Summary}", summary);
+            Logger.LogInformation("{Summary}", summary);
         }
+    }
+
+    /// <summary>彙總行的批次分佈：1-9、10-24、25-49、50。</summary>
+    private static int SizeBucket(int count)
+    {
+        if (count < 10)
+        {
+            return 0;
+        }
+
+        if (count < 25)
+        {
+            return 1;
+        }
+
+        return count < 50 ? 2 : 3;
     }
 
     private void FlushSuccessTally()
@@ -968,7 +1071,7 @@ public class HostedUniversalis : BackgroundService, IUniversalis
 
         if (summary != null)
         {
-            Logger.LogDebug("{Summary}", summary);
+            Logger.LogInformation("{Summary}", summary);
         }
     }
 
@@ -984,8 +1087,18 @@ public class HostedUniversalis : BackgroundService, IUniversalis
         var items = _successTally.Values.Sum(t => t.Items);
         var worlds = string.Join("、", _successTally.Select(kv => $"「{kv.Key}」{kv.Value.Batches} 批 {kv.Value.Items} 筆"));
         var minutes = Math.Max(1, (int)Math.Round((now - _successTallyStartTicks) / 60000.0));
+        var b = _tallySizeBuckets;
+        var summary =
+            $"universalis 查價成功彙總(約 {minutes} 分鐘內):共 {batches} 批 {items} 筆;{worlds}。"
+            + $"來源:背景更新 {_tallyBackgroundItems} 筆、介面 {_tallyInterfaceItems} 筆"
+            + $"(批次 背景 {_tallyBackgroundBatches}／介面 {_tallyInterfaceBatches}／混合 {_tallyMixedBatches});"
+            + $"每批筆數 1-9:{b[0]}、10-24:{b[1]}、25-49:{b[2]}、50:{b[3]};"
+            + $"自上次彙總以來送出請求 {Interlocked.Exchange(ref _requestsSent, 0)} 次(含失敗與成交紀錄)。";
         _successTally.Clear();
-        return $"universalis 查價成功彙總(約 {minutes} 分鐘內):共 {batches} 批 {items} 筆;{worlds}。";
+        _tallyBackgroundItems = _tallyInterfaceItems = 0;
+        _tallyBackgroundBatches = _tallyInterfaceBatches = _tallyMixedBatches = 0;
+        Array.Clear(b);
+        return summary;
     }
 
     protected virtual void Dispose(bool disposing)
