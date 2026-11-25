@@ -108,6 +108,12 @@ public class HostedUniversalis : BackgroundService, IUniversalis
     private const int MinBatchSize = UniversalisBatchSizing.MinBatchSize;
 
     /// <summary>
+    /// 回應內容（解壓後）上限。正常一批遠小於 1 MB，接近這個量的不會是價格資料；
+    /// 超過時 GetAsync 擲 <see cref="HttpRequestError.ConfigurationLimitExceeded"/>，各呼叫端放棄該次回應、不重試。
+    /// </summary>
+    private const long MaxResponseBytes = 8 * 1024 * 1024;
+
+    /// <summary>
     /// 目前是否還有任何世界查得到 universalis 資料。判定細節在 UniversalisAvailability:
     /// 依據 universalis 自己的世界清單逐個世界判定,不按客戶端語言一刀切。
     /// </summary>
@@ -172,6 +178,18 @@ public class HostedUniversalis : BackgroundService, IUniversalis
         Logger = logger;
         HttpClient = httpClient;
         httpClient.DefaultRequestHeaders.Add("User-Agent", $"AllaganTools/{_userAgent.PluginVersion}");
+        if (httpClient.MaxResponseContentBufferSize > MaxResponseBytes)
+        {
+            // 已送過請求的 HttpClient 不能再改上限；寧可不設也不讓建構失敗、整個插件載入不起來。
+            try
+            {
+                httpClient.MaxResponseContentBufferSize = MaxResponseBytes;
+            }
+            catch (InvalidOperationException)
+            {
+                logger.LogWarning("universalis 用的連線已經送過請求，無法設定回應大小上限；這次不限制回應大小，其餘照常。");
+            }
+        }
         UniversalisQueue = taskQueueFactory.Invoke("Universalis Queue", 1);
         _framework.Update += FrameworkOnUpdate;
     }
@@ -250,6 +268,12 @@ public class HostedUniversalis : BackgroundService, IUniversalis
             Logger.LogInformation(
                 "universalis 認得 {Count} 個世界,查價會依這份清單過濾。",
                 worlds.Count);
+        }
+        catch (HttpRequestException ex) when (IsResponseTooLarge(ex))
+        {
+            Logger.LogWarning(
+                "universalis 的世界清單回應超過 {LimitMb} MB 上限,已放棄這次回應;本次改用樂觀模式:照樣送出查價請求。",
+                MaxResponseBytes / (1024 * 1024));
         }
         catch (TaskCanceledException)
         {
@@ -453,6 +477,11 @@ public class HostedUniversalis : BackgroundService, IUniversalis
         {
             // 關閉/登出,或 HttpClient 自己逾時。成交歷史不是必需品。
         }
+        catch (HttpRequestException ex) when (IsResponseTooLarge(ex))
+        {
+            RecordHistoryOutcome(false);
+            ReportResponseTooLarge("成交歷史", worldName, itemCount);
+        }
         catch (HttpRequestException ex)
         {
             ReportHistoryUnavailable(worldId, worldName, ex.Message);
@@ -571,6 +600,18 @@ public class HostedUniversalis : BackgroundService, IUniversalis
 
         var trimmed = value.Trim().Replace('\r', ' ').Replace('\n', ' ');
         return trimmed.Length > 120 ? trimmed.Substring(0, 120) + "..." : trimmed;
+    }
+
+    private static bool IsResponseTooLarge(HttpRequestException ex)
+    {
+        return ex.HttpRequestError == HttpRequestError.ConfigurationLimitExceeded;
+    }
+
+    private void ReportResponseTooLarge(string what, string worldName, int itemCount)
+    {
+        Logger.LogWarning(
+            "universalis 的{What}回應超過 {LimitMb} MB 上限(世界「{WorldName}」,{Count} 筆),已放棄這次回應,不重試。",
+            what, MaxResponseBytes / (1024 * 1024), worldName, itemCount);
     }
 
     private static string DescribeStatus(HttpStatusCode? statusCode)
@@ -801,6 +842,13 @@ public class HostedUniversalis : BackgroundService, IUniversalis
                 await HandleFailedRequestAsync(itemIdList, worldId, worldName, null, ex.Message, url.Length,
                     token, attempt);
             }
+        }
+        catch (HttpRequestException ex) when (IsResponseTooLarge(ex))
+        {
+            // 重試同一批只會再拿到同樣大的回應，所以和解析失敗一樣直接放掉。
+            ReportResponseTooLarge("查價", worldName, itemIdList.Count);
+            LastFailure = DateTime.Now;
+            ReleaseQueued(itemIdList.Count);
         }
         catch (HttpRequestException ex)
         {

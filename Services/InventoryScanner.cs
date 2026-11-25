@@ -2391,6 +2391,8 @@ namespace CriticalCommonLib.Services
                 _pluginLog?.Verbose("Disposing {type} ({this})", GetType().Name, this);
                 _running = false;
                 if (_framework != null) _framework.Update -= FrameworkOnUpdate;
+                // 插件範圍的 IAddonLifecycle 解除後會從自己的清單移除，卸載時不會再解除第二次。
+                _addonLifecycle?.UnregisterListener(AddonEvent.PreFinalize, "MiragePrismPrismBox", PrismBoxFinalize);
                 _containerInfoNetworkHook?.Dispose();
                 _containerInfoNetworkHook = null;
                 if (_clientState != null) _clientState.Logout -= ClientStateOnLogout;
